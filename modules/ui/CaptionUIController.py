@@ -6,6 +6,7 @@ from modules.module.Blip2Model import Blip2Model
 from modules.module.BlipModel import BlipModel
 from modules.module.ClipSegModel import ClipSegModel
 from modules.module.MaskByColor import MaskByColor
+from modules.module.QwenVLModel import QwenVLModel
 from modules.module.RembgHumanModel import RembgHumanModel
 from modules.module.RembgModel import RembgModel
 from modules.module.WDModel import WDModel
@@ -346,6 +347,10 @@ class CaptionUIController:
             self._release_models()
             print("loading WD14_VIT_v2 model, this may take a while")
             self.captioning_model = WDModel(default_device, torch.float16)
+        elif model == "Qwen3-VL 4B" and model_type != "QwenVLModel":
+            self._release_models()
+            print("loading Qwen3-VL 4B model, this may take a while (~8GB download on first use)")
+            self.captioning_model = QwenVLModel(default_device, torch.float16)
 
     def print_help(self):
         print(self.help_text)

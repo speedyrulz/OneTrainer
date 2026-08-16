@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 
+from modules.util.enum.CurationCaptionModel import CurationCaptionModel
+from modules.util.enum.CurationCaptionPrecision import CurationCaptionPrecision
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.LearningRateScaler import LearningRateScaler
@@ -66,6 +68,138 @@ class BaseTrainingTabView(ABC):
             self.__setup_ernie_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_ideogram():
             self.__setup_ideogram_ui(column_0, column_1, column_2, controller, ui_state)
+
+        # Placed after the per-model-type layout, at a row past anything those layouts use, so the
+        # frame appears at the bottom of the last column for every model type without having to be
+        # threaded through each of them. Empty grid rows collapse, so the gap is not visible.
+        self.__create_curation_frame(column_2, 10, ui_state)
+
+    def __create_curation_frame(self, master, row, ui_state):
+        frame = self.components.section_frame(master, row)
+
+        self.components.label(
+            frame, 0, 0, "Detect Problem Images",
+            tooltip="Track how hard each image is as the run goes, normalised for the noise level "
+                    "each step happens to draw, and flag the ones that stay hard without improving. "
+                    "In practice those are usually caption/image mismatches. Verdicts go to the "
+                    "console, to tensorboard and to <workspace>/loss_log/problem_images.json.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 0, 1, ui_state, "curate_dataset")
+
+        self.components.label(
+            frame, 1, 0, "Per-Image Adaptive LR",
+            tooltip="Act on those verdicts. Images that look stuck are throttled so one bad caption "
+                    "cannot keep pulling the weights all run, images that have been mined out ease "
+                    "off to avoid overbake, and consistently healthy ones get a gentle boost. "
+                    "Applied by scaling each image's share of the loss.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 1, 1, ui_state, "curate_per_image_lr")
+
+        self.components.label(
+            frame, 2, 0, "Warmup Epochs",
+            tooltip="How many epochs to watch before acting on anything. A trend needs data, and "
+                    "the first epochs are the noisiest.",
+        )
+        self.components.entry(frame, 2, 1, ui_state, "curate_warmup_epochs")
+
+        self.components.label(
+            frame, 3, 0, "Plateau Patience",
+            tooltip="How many epoch boundaries with no image improving before the run is called "
+                    "finished. It reports a suggested checkpoint window rather than stopping.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 3, 1, ui_state, "curate_plateau_patience")
+
+        self.components.label(
+            frame, 4, 0, "Write Loss Log",
+            tooltip="Also write every image-step to <workspace>/loss_log/per_image_loss.jsonl for "
+                    "offline analysis. One line per image per step.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 4, 1, ui_state, "curate_write_log")
+
+        self.components.label(
+            frame, 5, 0, "Auto-Recaption Stuck",
+            tooltip="When an image is confirmed stuck, look at it again with a captioning model and "
+                    "rewrite its caption from what is actually visible, then give the image a fresh "
+                    "start. Two attempts per image; the second goes for exhaustive detail. Still "
+                    "stuck after both and the image is excluded for the rest of the run. Clears the "
+                    "text cache each time captions change, so they are re-encoded next epoch.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 5, 1, ui_state, "curate_recaption")
+
+        self.components.label(
+            frame, 6, 0, "Recaption Model",
+            tooltip="Which captioning model rewrites the captions. The same models the captioning "
+                    "tool offers; it is loaded between epochs and freed again. QWEN3_VL_4B is the "
+                    "one Fizgig uses and writes by far the best captions; it is an 8GB download but "
+                    "loads 4-bit quantized by default, needing about 4.5GB of VRAM free. BLIP2 is "
+                    "the light option.",
+            wide_tooltip=True,
+        )
+        self.components.options(
+            frame, 6, 1, [str(x) for x in list(CurationCaptionModel)], ui_state,
+            "curate_recaption_model",
+        )
+
+        self.components.label(
+            frame, 7, 0, "Recaption Precision",
+            tooltip="How the Qwen captioner is loaded. NF4 (4-bit) needs ~4.5GB free beside the "
+                    "training model and is the right choice on most cards; INT8 ~6.5GB; BF16 is the "
+                    "full ~10.5GB. If there is not enough free VRAM at the boundary, recaptioning "
+                    "is skipped with a console message rather than spilling into shared memory and "
+                    "stalling the run. Only affects QWEN3_VL_4B.",
+            wide_tooltip=True,
+        )
+        self.components.options(
+            frame, 7, 1, [str(x) for x in list(CurationCaptionPrecision)], ui_state,
+            "curate_recaption_precision",
+        )
+
+        self.components.label(
+            frame, 8, 0, "Recaption Trigger Word",
+            tooltip="Appended to the end of every rewritten caption. A trailing token is a weaker "
+                    "identity claim than a leading one, which is what you want for an image the "
+                    "model is already struggling with. Leave empty for none.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 8, 1, ui_state, "curate_recaption_trigger")
+
+        self.components.label(
+            frame, 9, 0, "Warm Up Look Outliers",
+            tooltip="Score every image against the rest of the set with CLIP, and ease the ones that "
+                    "look unlike the others in at a reduced learning rate that ramps to full over "
+                    "the first epochs. These are usually genuine but unusual — tight angles, "
+                    "profiles — and they pull hardest while the identity is still forming. Scores "
+                    "are cached beside the images, so this only runs once per dataset.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 9, 1, ui_state, "curate_warmup_outliers")
+
+        self.components.label(
+            frame, 10, 0, "Outlier Start LR",
+            tooltip="The multiplier an outlier starts at, ramping to full over the ramp epochs.",
+        )
+        self.components.entry(frame, 10, 1, ui_state, "curate_outlier_start")
+
+        self.components.label(
+            frame, 11, 0, "Outlier Ramp Epochs",
+            tooltip="How long an outlier takes to reach full strength. It is released early if it "
+                    "starts improving on its own.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 11, 1, ui_state, "curate_outlier_ramp_epochs")
+
+        self.components.label(
+            frame, 12, 0, "Outlier Sensitivity",
+            tooltip="How far below the middle of the pack an image must score to count as an "
+                    "outlier, in robust standard deviations. Lower catches more.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 12, 1, ui_state, "curate_outlier_deviations")
 
     def __setup_stable_diffusion_ui(self, column_0, column_1, column_2, controller, ui_state):
         self.__create_base_frame(column_0, 0, controller, ui_state)

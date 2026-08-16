@@ -62,6 +62,9 @@ class Optimizer(Enum):
     # ADAFACTOR
     ADAFACTOR = 'ADAFACTOR'
 
+    # Automagic
+    AUTOMAGIC3 = 'AUTOMAGIC3'
+
     # CAME
     CAME = 'CAME'
     CAME_8BIT = 'CAME_8BIT'
@@ -88,6 +91,7 @@ class Optimizer(Enum):
             self.PRODIGY,
             self.PRODIGY_PLUS_SCHEDULE_FREE,
             self.PRODIGY_ADV,
+            self.AUTOMAGIC3,
         ]
 
     @property
@@ -113,10 +117,19 @@ class Optimizer(Enum):
             Optimizer.MUON_ADV,
             Optimizer.ADAMUON_ADV,
             Optimizer.SIGNSGD_ADV,
+            Optimizer.AUTOMAGIC3,
         ]
 
     # Small helper for adjusting learning rates to adaptive optimizers.
     def maybe_adjust_lrs(self, lrs: dict[str, float], optimizer: torch.optim.Optimizer):
+        if self == self.AUTOMAGIC3 and hasattr(optimizer, "get_learning_rates"):
+            # Automagic3 keeps one adapted lr per param group, in group order
+            optimizer_lrs = optimizer.get_learning_rates()
+            return {
+                key: optimizer_lrs[i] if i < len(optimizer_lrs) else lr
+                for i, (key, lr) in enumerate(lrs.items())
+            }
+
         if self.is_adaptive:
             return {
                 # Return `effective_lr * d` if "effective_lr" key present, otherwise return `lr * d`

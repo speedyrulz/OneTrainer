@@ -107,6 +107,16 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "stochastic_rounding": True,
         "fused_back_pass": False,
     },
+    Optimizer.AUTOMAGIC3: {
+        "min_lr": 1e-8,
+        "max_lr": 1e3,
+        "beta2": 0.999,
+        "eps": 1e-30,
+        "clip_threshold": 1.0,
+        "weight_decay": 0.0,
+        "polarity_history": 8,
+        "fused_back_pass": False,
+    },
     Optimizer.ADAGRAD: {
         "lr_decay": 0,
         "weight_decay": 0,

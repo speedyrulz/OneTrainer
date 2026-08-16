@@ -22,6 +22,7 @@ from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.curation.DatasetCuration import DatasetCuration, curation_enabled
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.EMAMode import EMAMode
@@ -33,6 +34,7 @@ from modules.util.profiling_util import PeakMemoryRecorder, TorchMemoryRecorder,
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
+from modules.util.ValidationResult import ValidationResult
 
 import torch
 from torch import Tensor, nn
@@ -77,6 +79,24 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+
+        # per-image loss watch, or None when dataset curation is off
+        self.curation: DatasetCuration | None = None
+
+        # Segment support, used by MultiConfigTrainer. When segment_end_check is set, train() returns
+        # as soon as it returns True on a step where no gradients are pending, and records that it did
+        # so in segment_ended. suppress_scheduled_validation turns off the built-in validation trigger
+        # so the tournament can validate at its own segment boundaries instead.
+        self.segment_end_check: Callable[[TrainProgress], bool] | None = None
+        self.suppress_scheduled_validation = False
+        self.segment_ended = False
+
+        # Scheduled (not manually requested) samples, saves and backups are suppressed while a
+        # tournament segment runs: they would capture whichever candidate happens to be training at
+        # the time, and candidates are rewound afterwards. Sampling every candidate would also cost
+        # one full sampling pass per candidate per interval. The tournament samples and saves the
+        # winner itself. The "sample now" / "save now" / "backup now" buttons are unaffected.
+        self.suppress_scheduled_actions = False
 
     def start(self):
         if multi.is_master():
@@ -159,6 +179,10 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+        if curation_enabled(self.config) and multi.is_master():
+            self.curation = DatasetCuration(self.config, self.config.workspace_dir)
+            self.curation.attach_model(self.model)
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -341,13 +365,18 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
-    def __validate(self, train_progress: TrainProgress):
-        if self.__needs_validate(train_progress):
+    def __validate(
+            self,
+            train_progress: TrainProgress,
+            force: bool = False,
+            tensorboard_prefix: str = "loss/validation_step",
+    ) -> ValidationResult | None:
+        if force or self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
             current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
 
             if current_epoch_length_validation == 0:
-                return
+                return None
 
             self.callbacks.on_update_status("Calculating validation loss")
             self.model_setup.setup_train_device(self.model, self.config)
@@ -397,21 +426,55 @@ class GenericTrainer(BaseTrainer):
                 accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
                 concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
 
+            result = ValidationResult()
+
             for concept_seed, total_loss in accumulated_loss_per_concept.items():
                 average_loss = total_loss / concept_counts[concept_seed]
+                label = mapping_seed_to_label[concept_seed]
 
-                self.tensorboard.add_scalar(f"loss/validation_step/{mapping_seed_to_label[concept_seed]}",
+                result.per_concept[label] = average_loss
+                result.sample_counts[label] = concept_counts[concept_seed]
+
+                self.tensorboard.add_scalar(f"{tensorboard_prefix}/{label}",
                                             average_loss,
                                             train_progress.global_step)
 
-            if len(concept_counts) > 1:
-                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
-                total_count = sum(concept_counts[key] for key in concept_counts)
-                total_average_loss = total_loss / total_count
+            total_count = sum(concept_counts.values())
+            if total_count > 0:
+                total_loss = sum(accumulated_loss_per_concept.values())
+                result.total_average = total_loss / total_count
 
-                self.tensorboard.add_scalar("loss/validation_step/total_average",
-                                            total_average_loss,
+            if len(concept_counts) > 1:
+                self.tensorboard.add_scalar(f"{tensorboard_prefix}/total_average",
+                                            result.total_average,
                                             train_progress.global_step)
+
+            return result
+
+        return None
+
+    # --- hooks used by MultiConfigTrainer -------------------------------------------------------
+    # These exist because the methods above are name-mangled private members. Rather than renaming
+    # them (and creating avoidable conflicts when merging upstream changes), the subclass reaches
+    # them through these thin wrappers.
+
+    def run_validation(
+            self,
+            train_progress: TrainProgress,
+            tensorboard_prefix: str = "loss/validation_step",
+    ) -> ValidationResult | None:
+        return self.__validate(train_progress, force=True, tensorboard_prefix=tensorboard_prefix)
+
+    def run_sampling(self, train_progress: TrainProgress):
+        self.__sample_during_training(train_progress, torch.device(self.config.train_device))
+
+    def save_model_snapshot(self, train_progress: TrainProgress, print_msg: bool = True):
+        self.__save(train_progress, print_msg)
+
+    def remove_grad_hooks(self):
+        for handle in self.grad_hook_handles:
+            handle.remove()
+        self.grad_hook_handles = []
 
     def __save_backup_config(self, backup_path):
         config_path = os.path.join(backup_path, "onetrainer_config")
@@ -601,6 +664,35 @@ class GenericTrainer(BaseTrainer):
                     self.grad_hook_handles.append(handle)
 
 
+    def __curate_step(self, batch: dict, data: dict, loss: Tensor, train_progress: TrainProgress) -> Tensor:
+        """Record this step per image, and re-weight it by what curation has learned about them.
+
+        Returns the loss to train on. When curation is off, or this model type does not expose its
+        per-sample losses, the loss comes back exactly as it went in.
+        """
+        if self.curation is None:
+            return loss
+
+        sample_losses = self.model_setup.take_sample_losses()
+        keys = self.curation.image_keys(batch)
+        if sample_losses is None or not keys or sample_losses.shape[0] != len(keys):
+            return loss
+
+        try:
+            self.curation.observe_step(train_progress, keys, sample_losses, data)
+
+            weights = self.curation.sample_weights(keys, sample_losses.device, sample_losses.dtype)
+            if torch.equal(weights, torch.ones_like(weights)):
+                return loss
+            # Scaling a sample's loss scales exactly its share of the gradient, which is what a
+            # per-image learning rate means here. Averaging over the batch (not over the weights)
+            # keeps a throttled image reducing the step rather than being renormalised back up.
+            return (sample_losses * weights).mean()
+        except Exception:
+            traceback.print_exc()
+            tqdm.write("Error during dataset curation, continuing without it for this step")
+            return loss
+
     def __before_eval(self):
         # Special case for schedule-free optimizers, which need eval()
         # called before evaluation. Can and should move this to a callback
@@ -622,6 +714,12 @@ class GenericTrainer(BaseTrainer):
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
+
+        # train() can be called more than once per run (the multi-config tournament calls it once per
+        # candidate segment), and every call registers a fresh set of hooks. Drop the previous ones
+        # first so the optimizer step doesn't fire once per past segment.
+        self.remove_grad_hooks()
+        self.segment_ended = False
 
         self.__apply_fused_back_pass(scaler)
 
@@ -689,15 +787,17 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     multi.warn_parameter_divergence(self.parameters, train_device)
 
-                if not self.commands.get_stop_command() and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
+                if not self.commands.get_stop_command() and not self.suppress_scheduled_actions \
+                        and self.__needs_sample(train_progress) or self.commands.get_and_reset_sample_default_command():
                     self.__enqueue_sample_during_training(
                         lambda: self.__sample_during_training(train_progress, train_device)
                     )
-                if self.__needs_backup(train_progress):
-                    self.commands.backup()
+                if not self.suppress_scheduled_actions:
+                    if self.__needs_backup(train_progress):
+                        self.commands.backup()
 
-                if self.__needs_save(train_progress):
-                    self.commands.save()
+                    if self.__needs_save(train_progress):
+                        self.commands.save()
 
                 sample_commands = self.commands.get_and_reset_sample_custom_commands()
                 if sample_commands:
@@ -751,6 +851,7 @@ class GenericTrainer(BaseTrainer):
                         model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
 
                     loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    loss = self.__curate_step(batch, model_output_data, loss, train_progress)
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
@@ -825,7 +926,7 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
-                if self.config.validation and multi.is_master():
+                if self.config.validation and multi.is_master() and not self.suppress_scheduled_validation:
                     self.__validate(train_progress)
 
                 train_progress.next_step(self.config.batch_size)
@@ -834,10 +935,31 @@ class GenericTrainer(BaseTrainer):
                 if self.commands.get_stop_command():
                     return
 
+                # A segment may only end on an update-step boundary. Returning with gradients still
+                # accumulating would leave the optimizer half-way through a virtual batch, which the
+                # snapshot doesn't capture and the next candidate would inherit.
+                if self.segment_end_check is not None and not has_gradient \
+                        and self.segment_end_check(train_progress):
+                    self.segment_ended = True
+                    return
+
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
+            if self.curation is not None:
+                try:
+                    self.curation.epoch_boundary(train_progress, self.tensorboard)
+                except Exception:
+                    traceback.print_exc()
+                    tqdm.write("Error during dataset curation, continuing without this epoch's verdicts")
+
             if self.commands.get_stop_command():
+                return
+
+            # epoch-length segments land here: next_epoch() has just rolled the counter over, so an
+            # "N epochs" segment becomes complete exactly at the epoch boundary
+            if self.segment_end_check is not None and self.segment_end_check(train_progress):
+                self.segment_ended = True
                 return
 
     def end(self):
@@ -874,6 +996,9 @@ class GenericTrainer(BaseTrainer):
                     dtype=self.config.output_dtype.torch_dtype()
                 )
 
+        if self.curation is not None:
+            self.curation.close()
+
         if self.model is not None:
             self.model.to(self.temp_device)
 
@@ -883,5 +1008,4 @@ class GenericTrainer(BaseTrainer):
             if self.config.tensorboard and not self.config.tensorboard_always_on:
                 super()._stop_tensorboard()
 
-        for handle in self.grad_hook_handles:
-            handle.remove()
+        self.remove_grad_hooks()

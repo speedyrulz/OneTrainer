@@ -33,6 +33,20 @@ class BaseModelSetup(
         self.debug_mode = debug_mode
         self.frozen_parameters = {}
 
+        # The per-sample losses behind the scalar calculate_loss returned, stashed by the loss
+        # helpers. Dataset curation needs one loss per image rather than the batch mean, and
+        # re-deriving it would mean a second forward pass. Read it with take_sample_losses().
+        self.last_sample_losses = None
+
+    def take_sample_losses(self):
+        """The unreduced per-sample losses behind the last calculate_loss, or None.
+
+        Take-once: clears as it returns, so a caller can never be handed a previous step's losses
+        if the current model type does not produce them.
+        """
+        losses, self.last_sample_losses = self.last_sample_losses, None
+        return losses
+
     @abstractmethod
     def create_parameters(
             self,

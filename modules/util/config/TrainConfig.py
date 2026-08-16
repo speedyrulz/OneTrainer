@@ -12,6 +12,8 @@ from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
+from modules.util.enum.CurationCaptionModel import CurationCaptionModel
+from modules.util.enum.CurationCaptionPrecision import CurationCaptionPrecision
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
@@ -22,6 +24,11 @@ from modules.util.enum.LossScaler import LossScaler
 from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
+from modules.util.enum.MultiConfigMode import MultiConfigMode
+from modules.util.enum.MultiConfigPruneStrategy import MultiConfigPruneStrategy
+from modules.util.enum.MultiConfigSelection import MultiConfigSelection
+from modules.util.enum.MultiConfigStateStorage import MultiConfigStateStorage
+from modules.util.enum.MultiConfigSweepSetting import MultiConfigSweepSetting
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
@@ -30,6 +37,15 @@ from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
+
+# number of candidate config slots offered on the Multi Config tab for full-config tournaments
+MULTI_CONFIG_SLOT_COUNT = 10
+
+# number of value slots offered for a single-setting tournament
+MULTI_CONFIG_SWEEP_MAX = 10
+
+# the tournament needs at least two candidates to have anything to compare
+MULTI_CONFIG_MIN_CANDIDATES = 2
 
 
 class TrainOptimizerConfig(BaseConfig):
@@ -45,6 +61,9 @@ class TrainOptimizerConfig(BaseConfig):
     capturable: bool
     centered: bool
     clip_threshold: float
+    polarity_history: int
+    min_lr: float
+    max_lr: float
     d0: float
     d_coef: float
     dampening: float
@@ -159,6 +178,9 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("capturable", False, bool, False))
         data.append(("centered", False, bool, False))
         data.append(("clip_threshold", None, float, True))
+        data.append(("polarity_history", None, int, True))
+        data.append(("min_lr", None, float, True))
+        data.append(("max_lr", None, float, True))
         data.append(("d0", None, float, True))
         data.append(("d_coef", None, float, True))
         data.append(("dampening", None, float, True))
@@ -382,9 +404,63 @@ class TrainConfig(BaseConfig):
     validation: bool
     validate_after: float
     validate_after_unit: TimeUnit
+    validation_split_percent: float
+
+    # dataset curation
+    curate_dataset: bool
+    curate_per_image_lr: bool
+    curate_write_log: bool
+    curate_warmup_epochs: int
+    curate_plateau_patience: int
+    curate_recaption: bool
+    curate_recaption_model: CurationCaptionModel
+    curate_recaption_precision: CurationCaptionPrecision
+    curate_recaption_trigger: str
+    curate_warmup_outliers: bool
+    curate_outlier_start: float
+    curate_outlier_ramp_epochs: int
+    curate_outlier_deviations: float
     continue_last_backup: bool
     prevent_overwrites: bool
     include_train_config: ConfigPart
+
+    # multi-config validation tournament
+    multi_config: bool
+    multi_config_mode: MultiConfigMode
+    multi_config_sweep_setting: MultiConfigSweepSetting
+    multi_config_sweep_count: int
+    multi_config_sweep_value_1: str
+    multi_config_sweep_value_2: str
+    multi_config_sweep_value_3: str
+    multi_config_sweep_value_4: str
+    multi_config_sweep_value_5: str
+    multi_config_sweep_value_6: str
+    multi_config_sweep_value_7: str
+    multi_config_sweep_value_8: str
+    multi_config_sweep_value_9: str
+    multi_config_sweep_value_10: str
+    multi_config_path_count: int
+    multi_config_path_1: str
+    multi_config_path_2: str
+    multi_config_path_3: str
+    multi_config_path_4: str
+    multi_config_path_5: str
+    multi_config_path_6: str
+    multi_config_path_7: str
+    multi_config_path_8: str
+    multi_config_path_9: str
+    multi_config_path_10: str
+    multi_config_adaptive_lr: float
+    multi_config_adaptive_count: int
+    multi_config_selection: MultiConfigSelection
+    multi_config_state_storage: MultiConfigStateStorage
+    multi_config_save_each_round: bool
+    multi_config_deterministic_data: bool
+    multi_config_end_early: bool
+    multi_config_end_early_rounds: int
+    multi_config_prune: bool
+    multi_config_prune_after: int
+    multi_config_prune_strategy: MultiConfigPruneStrategy
 
     # multi-GPU
     multi_gpu: bool
@@ -950,6 +1026,29 @@ class TrainConfig(BaseConfig):
         else:
             return self.additional_embeddings
 
+    def multi_config_paths(self) -> list[str]:
+        # the filled-in candidate slots among the ones currently on screen, in slot order. Empty
+        # slots are skipped so the user can leave gaps without changing which candidates run, and
+        # slots past the selected count are ignored so lowering the count drops them rather than
+        # silently keeping them in the run.
+        count = max(0, min(int(self.multi_config_path_count or 0), MULTI_CONFIG_SLOT_COUNT))
+        paths = []
+        for i in range(1, count + 1):
+            path = (getattr(self, f"multi_config_path_{i}", "") or "").strip()
+            if path:
+                paths.append(path)
+        return paths
+
+    def multi_config_sweep_values(self) -> list[str]:
+        # the first multi_config_sweep_count value slots, whatever their contents. Unlike the config
+        # file slots these are not compacted: slot order is what the user typed, and a blank slot is
+        # an error rather than something to skip.
+        count = max(0, min(int(self.multi_config_sweep_count or 0), MULTI_CONFIG_SWEEP_MAX))
+        return [
+            (getattr(self, f"multi_config_sweep_value_{i}", "") or "").strip()
+            for i in range(1, count + 1)
+        ]
+
     def get_last_backup_path(self) -> str | None:
         backups_path = os.path.join(self.workspace_dir, "backup")
         if os.path.exists(backups_path):
@@ -1026,7 +1125,51 @@ class TrainConfig(BaseConfig):
         data.append(("validation", False, bool, False))
         data.append(("validate_after", 1, int, False))
         data.append(("validate_after_unit", TimeUnit.EPOCH, TimeUnit, False))
+        data.append(("validation_split_percent", 0.0, float, False))
+
+        # dataset curation
+        data.append(("curate_dataset", False, bool, False))
+        data.append(("curate_per_image_lr", False, bool, False))
+        data.append(("curate_write_log", False, bool, False))
+        data.append(("curate_warmup_epochs", 2, int, False))
+        data.append(("curate_plateau_patience", 2, int, False))
+        data.append(("curate_recaption", False, bool, False))
+        data.append(("curate_recaption_model", CurationCaptionModel.BLIP2, CurationCaptionModel, False))
+        data.append(("curate_recaption_precision", CurationCaptionPrecision.NF4, CurationCaptionPrecision, False))
+        data.append(("curate_recaption_trigger", "", str, False))
+        data.append(("curate_warmup_outliers", False, bool, False))
+        data.append(("curate_outlier_start", 0.4, float, False))
+        data.append(("curate_outlier_ramp_epochs", 4, int, False))
+        data.append(("curate_outlier_deviations", 1.5, float, False))
         data.append(("continue_last_backup", False, bool, False))
+
+        # multi-config validation tournament
+        data.append(("multi_config", False, bool, False))
+        data.append(("multi_config_mode", MultiConfigMode.FULL_CONFIGS, MultiConfigMode, False))
+        data.append(("multi_config_sweep_setting", MultiConfigSweepSetting.LEARNING_RATE,
+                     MultiConfigSweepSetting, False))
+        data.append(("multi_config_sweep_count", 3, int, False))
+        data.extend(
+            (f"multi_config_sweep_value_{slot}", "", str, False)
+            for slot in range(1, MULTI_CONFIG_SWEEP_MAX + 1)
+        )
+        data.append(("multi_config_path_count", 3, int, False))
+        data.extend(
+            (f"multi_config_path_{slot}", "", str, False)
+            for slot in range(1, MULTI_CONFIG_SLOT_COUNT + 1)
+        )
+        data.append(("multi_config_adaptive_lr", 3e-4, float, False))
+        data.append(("multi_config_adaptive_count", 3, int, False))
+        data.append(("multi_config_selection", MultiConfigSelection.TOTAL_AVERAGE, MultiConfigSelection, False))
+        data.append(("multi_config_state_storage", MultiConfigStateStorage.DISK, MultiConfigStateStorage, False))
+        data.append(("multi_config_save_each_round", True, bool, False))
+        data.append(("multi_config_deterministic_data", True, bool, False))
+        data.append(("multi_config_end_early", False, bool, False))
+        data.append(("multi_config_end_early_rounds", 2, int, False))
+        data.append(("multi_config_prune", False, bool, False))
+        data.append(("multi_config_prune_after", 5, int, False))
+        data.append(("multi_config_prune_strategy", MultiConfigPruneStrategy.NEVER_WON,
+                     MultiConfigPruneStrategy, False))
         data.append(("prevent_overwrites", False, bool, False))
         data.append(("include_train_config", ConfigPart.NONE, ConfigPart, False))
 

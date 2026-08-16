@@ -16,7 +16,10 @@ from modules.ui.CtkConceptTabView import CtkConceptTabView
 from modules.ui.CtkConvertModelUIView import CtkConvertModelUIView
 from modules.ui.CtkLoraTabView import CtkLoraTabView
 from modules.ui.CtkModelTabView import CtkModelTabView
+from modules.ui.CtkMultiConfigTabView import CtkMultiConfigTabView
+from modules.ui.CtkProblemImagesWindowView import CtkProblemImagesWindowView
 from modules.ui.CtkProfilingWindowView import CtkProfilingWindowView
+from modules.ui.CtkRepairStudioTabView import CtkRepairStudioTabView
 from modules.ui.CtkSampleWindowView import CtkSampleWindowView
 from modules.ui.CtkSamplingTabView import CtkSamplingTabView
 from modules.ui.CtkTopBarView import CtkTopBarView
@@ -24,7 +27,9 @@ from modules.ui.CtkTrainingTabView import CtkTrainingTabView
 from modules.ui.CtkVideoToolUIView import CtkVideoToolUIView
 from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
+from modules.ui.MultiConfigTabController import MultiConfigTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
+from modules.ui.RepairStudioTabController import RepairStudioTabController
 from modules.ui.SamplingTabController import SamplingTabController
 from modules.ui.TopBarController import TopBarController
 from modules.ui.TrainingTabController import TrainingTabController
@@ -255,9 +260,11 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         self.data_tab = self.create_data_tab(self.tabview.add("data"))
         self.concepts_tab = self.create_concepts_tab(self.tabview.add("concepts"))
         self.training_tab = self.create_training_tab(self.tabview.add("training"))
+        self.multi_config_tab = self.create_multi_config_tab(self.tabview.add("multi config"))
         self.sampling_tab = self.create_sampling_tab(self.tabview.add("sampling"))
         self.backup_tab = self.create_backup_tab(self.tabview.add("backup"))
         self.tools_tab = self.create_tools_tab(self.tabview.add("tools"))
+        self.repair_studio_tab = self.create_repair_studio_tab(self.tabview.add("repair studio"))
         self.additional_embeddings_tab = self.create_additional_embeddings_tab(self.tabview.add("additional embeddings"))
         self.cloud_tab = self.create_cloud_tab(self.tabview.add("cloud"))
 
@@ -295,6 +302,12 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
 
     def create_training_tab(self, master) -> CtkTrainingTabView:
         return CtkTrainingTabView(master, TrainingTabController(self.controller.train_config), self.ui_state)
+
+    def create_repair_studio_tab(self, master) -> CtkRepairStudioTabView:
+        return CtkRepairStudioTabView(master, RepairStudioTabController())
+
+    def create_multi_config_tab(self, master) -> CtkMultiConfigTabView:
+        return CtkMultiConfigTabView(master, MultiConfigTabController(self.controller.train_config), self.ui_state)
 
     def create_cloud_tab(self, master) -> CtkCloudTabView:
         return CtkCloudTabView(master, CloudTabController(self.controller.train_config, parent=self), self.ui_state)
@@ -354,6 +367,9 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
 
     def open_profiling_tool(self):
         self.profiling_window.deiconify()
+
+    def open_problem_images(self):
+        self.controller.open_problem_images(self, CtkProblemImagesWindowView)
 
     def change_model_type(self, model_type: ModelType):
         if self.model_tab:

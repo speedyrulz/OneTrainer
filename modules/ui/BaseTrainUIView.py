@@ -6,6 +6,7 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
 from modules.util.enum.PathIOType import PathIOType
+from modules.util.ui.validation_helpers import check_range
 
 
 class BaseTrainUIView(ABC):
@@ -90,6 +91,9 @@ class BaseTrainUIView(ABC):
 
     @abstractmethod
     def open_profiling_tool(self): pass
+
+    @abstractmethod
+    def open_problem_images(self): pass
 
     @abstractmethod
     def export_training(self): pass
@@ -180,6 +184,18 @@ class BaseTrainUIView(ABC):
         self.components.label(frame, 8, 2, "Validate after",
                          tooltip="The interval used when validate training")
         self.components.time_entry(frame, 8, 3, ui_state, "validate_after", "validate_after_unit")
+
+        self.components.label(frame, 9, 0, "Auto Validation Split %",
+                         tooltip="Hold back this percentage of every concept's images and captions as a "
+                                 "validation set, instead of setting aside separate validation concepts. "
+                                 "The percentage is taken from each concept on its own, so a small "
+                                 "concept still contributes at least one image and no concept is left "
+                                 "without training data. The same images are held back on every run. "
+                                 "0 turns it off. Clear the cache after changing this.",
+                         wide_tooltip=True)
+        self.components.entry(frame, 9, 1, ui_state, "validation_split_percent",
+                         extra_validate=check_range(lower=0, upper=90,
+                                                    message="Validation split must be between 0 and 90"))
 
         # device
         self.components.label(frame, 10, 0, "Dataloader Threads",
@@ -372,3 +388,11 @@ class BaseTrainUIView(ABC):
         self.components.label(frame, 4, 0, "Profiling Tool",
                          tooltip="Open the profiling tools.")
         self.components.button(frame, 4, 1, "Open", self.open_profiling_tool)
+
+        self.components.label(frame, 5, 0, "Problem Images",
+                         tooltip="Show what dataset curation has flagged: thumbnails, verdicts and "
+                                 "loss trends, refreshing each epoch. Captions can be edited here "
+                                 "while the run continues; the trainer reloads them at the next "
+                                 "epoch boundary, no restart needed.",
+                         wide_tooltip=True)
+        self.components.button(frame, 5, 1, "Open", self.open_problem_images)

@@ -21,6 +21,22 @@ Depending on the model you chose, this can take a while.
 
 Entries in the `Prefix` field will be added at the start of the caption. `Postfix` will be added at the end of the caption.
 
+#### Qwen3-VL
+
+`Qwen3-VL 4B` is a vision-language model rather than a continuation captioner, so it reads the
+`Initial Caption` field differently from the others: for Blip and Blip2 that field is the *first few
+words* of the caption and the model finishes the sentence, but Qwen is **told what to write**, so
+whatever you type there is used as the instruction.
+
+Leave it empty and it writes a factual single-sentence training caption naming the camera viewpoint,
+whether the face is visible, and the setting. Or type your own — `List every object in this image and
+its colour.`, `Name the art style and the medium.` — and it will do that instead.
+
+It is a much larger model than the others: an ~8GB download on first use, though it loads 4-bit
+quantized by default and runs in about 4.5GB of VRAM. It is also the captioner
+[dataset curation](DatasetCuration.md#rewriting-the-caption-of-a-stuck-image) uses to rewrite the
+captions of images that are fighting the run.
+
 ### Manual masking
 
 Check the `Enable Mask Editing` checkbox at the top. Now you can draw a mask onto the image. Left-click adds to the

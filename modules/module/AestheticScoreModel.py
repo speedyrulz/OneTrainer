@@ -1,5 +1,7 @@
 import os
 
+from modules.util.clip_util import image_features
+
 import torch
 from torch import nn
 from torchvision.transforms import transforms
@@ -65,7 +67,9 @@ class AestheticScoreModel(nn.Module):
         x = (x / 2.0 + 0.5).clamp(0.0, 1.0)
         x = self.crop(self.resize(x))
         x = self.normalize(x)
-        embedding = self.clip.get_image_features(pixel_values=x)
+        # not clip.get_image_features directly: from transformers 5 that returns a wrapper object,
+        # not a tensor, and the normalisation below would raise on it
+        embedding = image_features(self.clip, x)
         embedding = embedding / torch.linalg.vector_norm(embedding, dim=-1, keepdim=True)
         score = self.mlp_model(embedding).squeeze(1)
         return abs(score - self.score_target)

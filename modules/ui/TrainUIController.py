@@ -13,12 +13,14 @@ import scripts.generate_debug_report
 from modules.ui.BaseTrainUIView import BaseTrainUIView
 from modules.ui.CaptionUIController import CaptionUIController
 from modules.ui.ConvertModelUIController import ConvertModelUIController
+from modules.ui.ProblemImagesWindowController import ProblemImagesWindowController
 from modules.ui.SampleWindowController import SampleWindowController
 from modules.ui.VideoToolUIController import VideoToolUIController
 from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.multi_config_util import validate_before_start as validate_multi_config
 from modules.util.profiling_util import PeakMemoryRecorder
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -43,6 +45,9 @@ class TrainUIController:
         # the currently open sample window, or None. Tracked so a second click doesn't spawn a
         # second (non-modal) window - the sample tool isn't designed to run two instances at once.
         self.sample_window = None
+
+        # the open Problem Images window, or None
+        self.problem_images_window = None
 
     def on_update_train_progress(self, train_progress: TrainProgress, max_step: int, max_epoch: int):
         # capture session start on first progress update
@@ -201,6 +206,23 @@ class TrainUIController:
                 training_callbacks.set_on_sample_custom()
             parent.connect_window_closed(self.sample_window, on_closed)
 
+    def open_problem_images(self, parent, view_cls):
+        # A second window would poll the same report and fight over the caption edit queue, so a
+        # repeat click re-focuses the one already open.
+        if self.problem_images_window is not None:
+            parent.show_window(self.problem_images_window)
+            return self.problem_images_window
+
+        controller = ProblemImagesWindowController(self.train_config)
+        self.problem_images_window = view_cls(parent, controller)
+        parent.show_window(self.problem_images_window)
+
+        def on_closed():
+            self.problem_images_window = None
+
+        parent.connect_window_closed(self.problem_images_window, on_closed)
+        return self.problem_images_window
+
     def sample_now(self):
         train_commands = self.training_commands
         if train_commands:
@@ -284,6 +306,11 @@ class TrainUIController:
             self.view.save_default()
 
             errors = flush_and_validate_all()
+            if errors:
+                self.view.show_validation_errors(errors)
+                return
+
+            errors = validate_multi_config(self.train_config)
             if errors:
                 self.view.show_validation_errors(errors)
                 return

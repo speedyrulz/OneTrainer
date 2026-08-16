@@ -7,6 +7,7 @@ from modules.ui.CloudTabController import CloudTabController
 from modules.ui.ConceptTabController import ConceptTabController
 from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
+from modules.ui.MultiConfigTabController import MultiConfigTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
 from modules.ui.PySide6AdditionalEmbeddingsTabView import PySide6AdditionalEmbeddingsTabView
 from modules.ui.PySide6CaptionUIView import PySide6CaptionUIView
@@ -15,12 +16,16 @@ from modules.ui.PySide6ConceptTabView import PySide6ConceptTabView
 from modules.ui.PySide6ConvertModelUIView import PySide6ConvertModelUIView
 from modules.ui.PySide6LoraTabView import PySide6LoraTabView
 from modules.ui.PySide6ModelTabView import PySide6ModelTabView
+from modules.ui.PySide6MultiConfigTabView import PySide6MultiConfigTabView
+from modules.ui.PySide6ProblemImagesWindowView import PySide6ProblemImagesWindowView
 from modules.ui.PySide6ProfilingWindowView import PySide6ProfilingWindowView
+from modules.ui.PySide6RepairStudioTabView import PySide6RepairStudioTabView
 from modules.ui.PySide6SampleWindowView import PySide6SampleWindowView
 from modules.ui.PySide6SamplingTabView import PySide6SamplingTabView
 from modules.ui.PySide6TopBarView import PySide6TopBarView
 from modules.ui.PySide6TrainingTabView import PySide6TrainingTabView
 from modules.ui.PySide6VideoToolUIView import PySide6VideoToolUIView
+from modules.ui.RepairStudioTabController import RepairStudioTabController
 from modules.ui.SamplingTabController import SamplingTabController
 from modules.ui.TopBarController import TopBarController
 from modules.ui.TrainingTabController import TrainingTabController
@@ -61,6 +66,8 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
 
         self.model_tab = None
         self.training_tab = None
+        self.multi_config_tab = None
+        self.repair_studio_tab = None
         self.lora_tab = None
         self.cloud_tab = None
         self.concepts_tab = None
@@ -266,6 +273,12 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         self.tabview.addTab(self.training_tab, "training")
         self._tab_widgets["training"] = self.training_tab
 
+        self.multi_config_tab = PySide6MultiConfigTabView(
+            None, MultiConfigTabController(self.controller.train_config), self.ui_state
+        )
+        self.tabview.addTab(self.multi_config_tab, "multi config")
+        self._tab_widgets["multi config"] = self.multi_config_tab
+
         sampling_page = self.create_sampling_tab()
         self.tabview.addTab(sampling_page, "sampling")
         self._tab_widgets["sampling"] = sampling_page
@@ -277,6 +290,10 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         tools_page = self._create_scrollable_tab(self._configure_tools_frame)
         self.tabview.addTab(tools_page, "tools")
         self._tab_widgets["tools"] = tools_page
+
+        self.repair_studio_tab = PySide6RepairStudioTabView(None, RepairStudioTabController())
+        self.tabview.addTab(self.repair_studio_tab, "repair studio")
+        self._tab_widgets["repair studio"] = self.repair_studio_tab
 
         additional_embeddings_page = QWidget()
         self.additional_embeddings_tab = PySide6AdditionalEmbeddingsTabView(
@@ -322,6 +339,9 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
 
     def open_profiling_tool(self):
         self.profiling_window.show()
+
+    def open_problem_images(self):
+        self.controller.open_problem_images(self, PySide6ProblemImagesWindowView)
 
     def change_model_type(self, model_type: ModelType):
         if self.model_tab:

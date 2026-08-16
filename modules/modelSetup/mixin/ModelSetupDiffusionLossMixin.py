@@ -302,6 +302,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case _:
                     raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for diffusion models")
 
+        # kept for dataset curation, which needs one loss per image rather than the batch mean
+        self.last_sample_losses = losses
         return losses
 
     def _flow_matching_losses(
@@ -340,4 +342,6 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case _:
                     raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models")
 
+        # kept for dataset curation, which needs one loss per image rather than the batch mean
+        self.last_sample_losses = losses
         return losses

@@ -4,6 +4,8 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.mixin.DataLoaderMgdsMixin import validation_split_enabled
+from modules.dataLoader.pipelineModules.ValidationSplit import ValidationSplit
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -56,7 +58,12 @@ from diffusers import AutoencoderKL
 
 
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
-    def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
+    def _enumerate_input_modules(
+            self,
+            config: TrainConfig,
+            allow_videos: bool = False,
+            is_validation: bool = False,
+    ) -> list:
         supported_extensions = set()
         supported_extensions |= path_util.supported_image_extensions()
 
@@ -78,7 +85,18 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         cond_path = ModifyPath(in_name='image_path', out_name='cond_path', postfix='-condlabel', extension='.png')
         sample_prompt_path = ModifyPath(in_name='image_path', out_name='sample_prompt_path', postfix='', extension='.txt')
 
-        modules = [download_datasets, collect_paths, sample_prompt_path]
+        modules = [download_datasets, collect_paths]
+
+        if validation_split_enabled(config):
+            # directly after the paths are enumerated, so everything downstream only ever sees this
+            # side's share of them
+            modules.append(ValidationSplit(
+                path_in_name='image_path', concept_in_name='concept',
+                path_out_name='image_path', concept_out_name='concept',
+                percentage=config.validation_split_percent, is_validation=is_validation,
+            ))
+
+        modules.append(sample_prompt_path)
 
         if config.masked_training:
             modules.append(mask_path)
@@ -390,7 +408,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             vae_frame_dim: bool=False,
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
-        enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
+        enumerate_input = self._enumerate_input_modules(
+            config, allow_videos=allow_video_files, is_validation=is_validation
+        )
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
         aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
