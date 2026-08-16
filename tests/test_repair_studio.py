@@ -174,15 +174,18 @@ def test_the_scale_is_alpha_over_rank(flux_lora):
     assert module.scale == 0.5
 
 
-def test_a_lycoris_lora_is_refused_rather_than_mangled(tmp_path):
+def test_a_lokr_lora_now_opens(tmp_path):
     path = tmp_path / "lokr.safetensors"
     save_file({
         "lora_unet_double_blocks_0_img_attn_proj.lokr_w1": torch.randn(4, 4),
         "lora_unet_double_blocks_0_img_attn_proj.lokr_w2": torch.randn(4, 4),
     }, str(path))
 
-    with pytest.raises(UnsupportedLoRA, match="LyCORIS"):
-        lora_file.load(str(path))
+    loaded = lora_file.load(str(path))
+
+    module = loaded.modules["lora_unet_double_blocks_0_img_attn_proj"]
+    assert module.lycoris_kind == "lokr"
+    assert not module.is_standard
 
 
 def test_a_file_that_is_not_a_lora_says_so(tmp_path):
@@ -508,15 +511,17 @@ def test_browsing_a_second_lora_keeps_the_edits(tmp_path, flux_lora):
 
 
 def test_a_lora_that_cannot_be_opened_reports_why(tmp_path):
-    path = tmp_path / "lokr.safetensors"
+    # LoKR/LoHa open and edit exactly now; Tucker is the variant that still cannot
+    path = tmp_path / "tucker.safetensors"
     save_file({"lora_unet_blocks_0_x.lokr_w1": torch.randn(2, 2),
-               "lora_unet_blocks_0_x.lokr_w2": torch.randn(2, 2)}, str(path))
+               "lora_unet_blocks_0_x.lokr_w2": torch.randn(2, 2),
+               "lora_unet_blocks_0_x.lokr_t2": torch.randn(2, 2, 2)}, str(path))
     controller = RepairStudioTabController()
 
     error = controller.load_primary(str(path))
 
     assert error is not None
-    assert "LyCORIS" in error
+    assert "Tucker" in error
 
 
 def test_a_donor_with_nothing_in_common_is_rejected_on_load(tmp_path, flux_lora):
@@ -793,3 +798,283 @@ def test_qt_switching_lora_leaves_no_stale_rows(qt_app, tmp_path, flux_lora):
 
     assert set(tab.rows) == {"in_4"}
     assert not any(t.startswith("Double block") for t in qt_texts(tab))
+
+
+# --- LyCORIS, edited losslessly -------------------------------------------------------------------
+#
+# LoKR and LoHa deltas are linear in their first factor, so a per-block multiplier folds into that
+# factor exactly — no SVD, no format conversion, alpha untouched. Every claim here is judged by
+# densifying the delta and measuring, because "lossless" is the kind of word that needs evidence.
+
+
+LOKR_MODULES = ["lora_unet_double_blocks_0_img_attn_proj", "lora_unet_single_blocks_2_linear1"]
+
+
+def write_lokr(path, module_names, *, factored=False, alpha=2.0, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    state_dict = {}
+    for name in module_names:
+        if factored:
+            state_dict[f"{name}.lokr_w1_a"] = torch.randn(4, 2, generator=generator)
+            state_dict[f"{name}.lokr_w1_b"] = torch.randn(2, 3, generator=generator)
+        else:
+            state_dict[f"{name}.lokr_w1"] = torch.randn(4, 3, generator=generator)
+        state_dict[f"{name}.lokr_w2"] = torch.randn(2, 2, generator=generator)
+        state_dict[f"{name}.alpha"] = torch.tensor(float(alpha))
+    save_file(state_dict, str(path))
+    return str(path)
+
+
+def write_loha(path, module_names, *, alpha=2.0, rank=2, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    state_dict = {}
+    for name in module_names:
+        for i in (1, 2):
+            state_dict[f"{name}.hada_w{i}_a"] = torch.randn(8, rank, generator=generator)
+            state_dict[f"{name}.hada_w{i}_b"] = torch.randn(rank, 6, generator=generator)
+        state_dict[f"{name}.alpha"] = torch.tensor(float(alpha))
+    save_file(state_dict, str(path))
+    return str(path)
+
+
+def bake_lycoris(tmp_path, source_path, edits: dict):
+    primary = lora_file.load(source_path)
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+    for block_id, value in edits.items():
+        state.blocks[block_id].primary_strength = value
+    out = str(tmp_path / "baked.safetensors")
+    summary = bake_module.bake(primary, state, out, None)
+    return primary, lora_file.load(out), summary
+
+
+@pytest.mark.parametrize("factored", [False, True], ids=["full-matrix", "factored"])
+def test_a_rescaled_lokr_block_is_exactly_the_slider_times_the_original(tmp_path, factored):
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, factored=factored, seed=1)
+
+    primary, baked, _summary = bake_lycoris(tmp_path, source, {"double_0": 0.35})
+
+    for name in primary.modules_in("double_0"):
+        want = contribution(primary.modules[name], 0.35)
+        got = contribution(baked.modules[name], 1.0)
+        assert torch.allclose(want, got, atol=1e-5), name
+
+
+def test_a_rescaled_loha_block_is_exactly_the_slider_times_the_original(tmp_path):
+    source = write_loha(tmp_path / "loha.safetensors", LOKR_MODULES, seed=2)
+
+    primary, baked, _summary = bake_lycoris(tmp_path, source, {"single_2": -1.5})
+
+    for name in primary.modules_in("single_2"):
+        want = contribution(primary.modules[name], -1.5)
+        assert torch.allclose(want, contribution(baked.modules[name], 1.0), atol=1e-5), name
+
+
+def test_an_untouched_lycoris_module_is_byte_identical(tmp_path):
+    # Fizgig's headline claim for its own lossless bake, held here too: a saved file with no edits
+    # IS the original, tensor for tensor — alpha included
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, seed=3)
+
+    _primary, _baked, _summary = bake_lycoris(tmp_path, source, {})
+
+    original, baked = load_file(source), load_file(str(tmp_path / "baked.safetensors"))
+    assert set(original) == set(baked)
+    for key in original:
+        assert torch.equal(original[key], baked[key]), key
+
+
+def test_only_the_first_factor_changes(tmp_path):
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, factored=True, seed=4)
+
+    _primary, _baked, _summary = bake_lycoris(tmp_path, source, {"double_0": 0.5})
+
+    original, baked = load_file(source), load_file(str(tmp_path / "baked.safetensors"))
+    name = LOKR_MODULES[0]
+    assert not torch.equal(original[f"{name}.lokr_w1_a"], baked[f"{name}.lokr_w1_a"])
+    # everything else in the module — including the second factor and alpha — is untouched, which
+    # is what keeps the file loadable by anything that loaded the original
+    for suffix in ("lokr_w1_b", "lokr_w2", "alpha"):
+        assert torch.equal(original[f"{name}.{suffix}"], baked[f"{name}.{suffix}"]), suffix
+
+
+def test_the_lycoris_alpha_is_never_rewritten(tmp_path):
+    # the standard bake normalises alpha = rank; the LyCORIS bake must NOT do the analogue, because
+    # the sentinel-alpha convention it would need is not read by every loader
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, alpha=2.0, seed=5)
+
+    _primary, baked, _summary = bake_lycoris(tmp_path, source, {"double_0": 0.5})
+
+    assert baked.modules[LOKR_MODULES[0]].alpha == 2.0
+
+
+def test_a_zeroed_lycoris_block_is_gone_from_the_file(tmp_path):
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, seed=6)
+    primary = lora_file.load(source)
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+    state.zero("double_0")
+
+    out = str(tmp_path / "baked.safetensors")
+    summary = bake_module.bake(primary, state, out, None)
+
+    assert summary.dropped == ["double_0"]
+    assert not any(block_for(name).id == "double_0" for name in lora_file.load(out).modules)
+
+
+def test_the_lokr_scale_convention_matches_lycoris_inference(tmp_path):
+    # alpha / min(active decomposition ranks); a full-matrix LoKR has dim 1, so scale = alpha.
+    # Getting this wrong silently rescales every delta the tests then "verify" against itself,
+    # which is why it is pinned explicitly.
+    full = lora_file.load(write_lokr(tmp_path / "full.safetensors", LOKR_MODULES, alpha=2.0))
+    factored = lora_file.load(write_lokr(tmp_path / "fact.safetensors", LOKR_MODULES,
+                                         factored=True, alpha=2.0))
+
+    assert full.modules[LOKR_MODULES[0]].scale == 2.0       # alpha / 1
+    assert factored.modules[LOKR_MODULES[0]].scale == 1.0   # alpha / rank 2
+
+
+def test_a_sentinel_alpha_means_the_scale_is_already_baked(tmp_path):
+    path = tmp_path / "refined.safetensors"
+    save_file({
+        f"{LOKR_MODULES[0]}.lokr_w1": torch.randn(4, 3),
+        f"{LOKR_MODULES[0]}.lokr_w2": torch.randn(2, 2),
+        f"{LOKR_MODULES[0]}.alpha": torch.tensor(1e10),
+    }, str(path))
+
+    # Fizgig's refined exports write alpha = 1e10 to mean scale 1.0; reading it as alpha/dim
+    # would multiply the delta by ten billion
+    assert lora_file.load(str(path)).modules[LOKR_MODULES[0]].scale == 1.0
+
+
+def test_blending_a_lycoris_block_is_refused_not_approximated(tmp_path, donor_lora):
+    source = write_lokr(tmp_path / "lokr.safetensors", FLUX_MODULES, seed=7)
+    primary = lora_file.load(source)
+    donor = lora_file.load(donor_lora)
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+    state.blocks["double_0"].donor_strength = 0.5
+
+    with pytest.raises(UnsupportedLoRA, match="exactly"):
+        bake_module.bake(primary, state, str(tmp_path / "out.safetensors"), donor)
+
+
+def test_a_tucker_lokr_is_refused_with_a_reason(tmp_path):
+    path = tmp_path / "tucker.safetensors"
+    save_file({
+        f"{LOKR_MODULES[0]}.lokr_w1": torch.randn(4, 3),
+        f"{LOKR_MODULES[0]}.lokr_w2": torch.randn(2, 2),
+        f"{LOKR_MODULES[0]}.lokr_t2": torch.randn(2, 2, 2),
+    }, str(path))
+
+    with pytest.raises(UnsupportedLoRA, match="Tucker"):
+        lora_file.load(str(path))
+
+
+def test_a_lokr_missing_its_second_half_is_caught(tmp_path):
+    path = tmp_path / "half.safetensors"
+    save_file({f"{LOKR_MODULES[0]}.lokr_w1": torch.randn(4, 3)}, str(path))
+
+    with pytest.raises(UnsupportedLoRA, match="truncated"):
+        lora_file.load(str(path))
+
+
+def test_a_mixed_file_edits_both_forms_correctly(tmp_path):
+    # one file, one block standard and one LoKR — real exports mix forms
+    generator = torch.Generator().manual_seed(8)
+    path = tmp_path / "mixed.safetensors"
+    save_file({
+        "lora_unet_double_blocks_0_img_attn_proj.lora_down.weight": torch.randn(4, 6, generator=generator),
+        "lora_unet_double_blocks_0_img_attn_proj.lora_up.weight": torch.randn(8, 4, generator=generator),
+        "lora_unet_double_blocks_0_img_attn_proj.alpha": torch.tensor(2.0),
+        "lora_unet_single_blocks_2_linear1.lokr_w1": torch.randn(4, 3, generator=generator),
+        "lora_unet_single_blocks_2_linear1.lokr_w2": torch.randn(2, 2, generator=generator),
+        "lora_unet_single_blocks_2_linear1.alpha": torch.tensor(2.0),
+    }, str(path))
+
+    primary, baked, _summary = bake_lycoris(tmp_path, str(path), {"double_0": 0.5, "single_2": 0.25})
+
+    for name, multiplier in (("lora_unet_double_blocks_0_img_attn_proj", 0.5),
+                             ("lora_unet_single_blocks_2_linear1", 0.25)):
+        want = contribution(primary.modules[name], multiplier)
+        assert torch.allclose(want, contribution(baked.modules[name], 1.0), atol=1e-5), name
+
+
+def test_the_controller_opens_a_lokr_and_says_so(tmp_path):
+    source = write_lokr(tmp_path / "lokr.safetensors", LOKR_MODULES, seed=9)
+    controller = RepairStudioTabController()
+
+    assert controller.load_primary(source) is None
+    assert "LoKR" in controller.primary_summary()
+    assert set(controller.state.blocks) == {"double_0", "single_2"}
+
+
+def test_a_lycoris_donor_pair_does_not_crash_the_mismatch_check(tmp_path):
+    primary_path = write_lokr(tmp_path / "p.safetensors", LOKR_MODULES, seed=10)
+    donor_path = write_lokr(tmp_path / "d.safetensors", LOKR_MODULES, seed=11)
+    controller = RepairStudioTabController()
+    controller.load_primary(primary_path)
+
+    # loads fine; the exactness refusal only happens if a blend is actually asked for
+    assert controller.load_donor(donor_path) is None
+
+
+# --- DoRA: partial strengths refused, not silently wrong ------------------------------------------
+
+
+def write_dora(path, module_names, *, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    state_dict = {}
+    for name in module_names:
+        state_dict[f"{name}.lora_down.weight"] = torch.randn(4, 6, generator=generator)
+        state_dict[f"{name}.lora_up.weight"] = torch.randn(8, 4, generator=generator)
+        state_dict[f"{name}.alpha"] = torch.tensor(4.0)
+        state_dict[f"{name}.dora_scale"] = torch.randn(8, 1, generator=generator)
+    save_file(state_dict, str(path))
+    return str(path)
+
+
+def test_rescaling_a_dora_block_is_refused_with_the_reason(tmp_path):
+    # a DoRA delta is renormalised at load time, so scaling its matrices does not scale its effect;
+    # the old behaviour was worse than refusal — the dora_scale key was silently dropped
+    source = write_dora(tmp_path / "dora.safetensors", FLUX_MODULES, seed=12)
+    primary = lora_file.load(source)
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+    state.blocks["double_0"].primary_strength = 0.5
+
+    with pytest.raises(UnsupportedLoRA, match="DoRA"):
+        bake_module.bake(primary, state, str(tmp_path / "out.safetensors"), None)
+
+
+def test_an_untouched_dora_block_passes_through_whatever_its_alpha(tmp_path):
+    # a DoRA module at strength 1.0 must come out byte-identical even when alpha != rank —
+    # normalising its scale would be the very edit the DoRA guard exists to refuse
+    generator = torch.Generator().manual_seed(14)
+    path = tmp_path / "dora_odd_alpha.safetensors"
+    name = FLUX_MODULES[0]
+    save_file({
+        f"{name}.lora_down.weight": torch.randn(4, 6, generator=generator),
+        f"{name}.lora_up.weight": torch.randn(8, 4, generator=generator),
+        f"{name}.alpha": torch.tensor(2.0),  # scale 0.5, deliberately not 1.0
+        f"{name}.dora_scale": torch.randn(8, 1, generator=generator),
+    }, str(path))
+    primary = lora_file.load(str(path))
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+
+    out = str(tmp_path / "baked.safetensors")
+    bake_module.bake(primary, state, out, None)
+
+    original, baked = load_file(str(path)), load_file(out)
+    for key in original:
+        assert torch.equal(original[key], baked[key]), key
+
+
+def test_a_dora_block_at_full_strength_keeps_its_dora_scale(tmp_path):
+    source = write_dora(tmp_path / "dora.safetensors", FLUX_MODULES, seed=13)
+    primary = lora_file.load(source)
+    state = SliderState.for_blocks(b.id for b in primary.blocks)
+    state.zero("single_0")  # dropping is fine — the whole block goes, dora key included
+
+    out = str(tmp_path / "baked.safetensors")
+    bake_module.bake(primary, state, out, None)
+
+    baked = load_file(out)
+    name = FLUX_MODULES[0]  # an untouched block
+    assert torch.equal(load_file(source)[f"{name}.dora_scale"], baked[f"{name}.dora_scale"])
+    assert not any(k.startswith("lora_unet_single_blocks_0_") for k in baked)

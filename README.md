@@ -67,6 +67,8 @@ A new **repair studio** tab (ported from Fizgig) for editing a finished LoRA per
 
 -   One slider per block, discovered from the file's own key naming — kohya, ComfyUI,
     diffusers/peft, and all OneTrainer formats open the same way, whatever the architecture
+-   **LoKR and LoHa edit exactly in native format** — both are linear in their first factor, so
+    per-block strengths bake in with no SVD, and an untouched module stays byte-identical
 -   Quick-sets on every slider: **[0]** drop the block, **[1]** trained strength, **[±]** invert,
     **[⚖]** balance primary + donor at 1.0 to cross-fade two LoRAs
 -   **Donor blending** by exact rank concatenation — no SVD, no approximation

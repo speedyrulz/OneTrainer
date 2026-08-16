@@ -21,11 +21,13 @@ MODULE_SUFFIXES = (
     ".alpha", ".dora_scale",
 )
 
-# LyCORIS. Recognised so a LoKR/LoHa file is refused with a straight answer rather than silently
-# passed through as if it had been edited.
+# LyCORIS. LoKR and LoHa edit exactly (their deltas are linear in the first factor); the Tucker
+# core tensors are recognised so a Tucker file is refused with a straight answer rather than
+# silently mis-edited.
 LYCORIS_SUFFIXES = (
     ".lokr_w1", ".lokr_w2", ".lokr_w1_a", ".lokr_w1_b", ".lokr_w2_a", ".lokr_w2_b",
-    ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
+    ".lokr_t1", ".lokr_t2",
+    ".hada_w1_a", ".hada_w1_b", ".hada_w2_a", ".hada_w2_b", ".hada_t1", ".hada_t2",
 )
 
 # The text-encoder namespaces every format uses, so a text-encoder key is never mistaken for a

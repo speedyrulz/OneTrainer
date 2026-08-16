@@ -17,6 +17,12 @@ Multiplying those out gives `m_p·scale_p·up_p@down_p + m_d·scale_d·up_d@down
 contributions, with no SVD and no loss. The price is a file whose rank is the sum of the two, which
 is why a donor at zero strength is dropped rather than concatenated as a block of zeros.
 
+LyCORIS (LoKR / LoHa) edits are exact too, in native format: both deltas are *linear in their first
+factor* — `kron(m·w1, w2) = m·kron(w1, w2)` and `(m·W1) ∘ W2 = m·(W1 ∘ W2)` — so the multiplier
+folds into `lokr_w1`/`lokr_w1_a`/`hada_w1_a` and nothing else changes. Alpha stays untouched (see
+`_scaled_lycoris` for why that beats Fizgig's sentinel). The one thing that cannot be exact is
+donor-blending a LyCORIS block, so that is refused rather than approximated.
+
 Ported from [Fizgig](https://github.com/shootthesound/Fizgig) by Peter Neill (Apache 2.0).
 """
 
@@ -124,8 +130,15 @@ def plan(primary: LoraFile, state: SliderState, donor: LoraFile | None = None) -
         elif use_primary and use_donor:
             action = BLEND
         elif use_primary:
-            action = KEEP if (block.primary_strength == 1.0 and primary_module.scale == 1.0) \
-                else RESCALE
+            # A LyCORIS or DoRA module at strength 1.0 passes through byte-identical, alpha and
+            # all — LyCORIS because only the multiplier ever folds in, DoRA because folding its
+            # scale would count as the edit its guard refuses. A plain standard module is
+            # normalised to alpha = rank, so a non-unit scale is folded even at strength 1.0.
+            if primary_module.is_lycoris or primary_module.is_dora:
+                action = KEEP if block.primary_strength == 1.0 else RESCALE
+            else:
+                action = KEEP if (block.primary_strength == 1.0 and primary_module.scale == 1.0) \
+                    else RESCALE
         else:
             action = DONOR_ONLY
 
@@ -180,6 +193,41 @@ def _weighted(module: LoraModule, multiplier: float) -> tuple[torch.Tensor, torc
     return new_up, down.clone(), module.rank
 
 
+def _guard_editable(module: LoraModule, block_id: str) -> None:
+    """Refuse the edits whose result would not be what the slider says.
+
+    A DoRA delta is renormalised against the base weight at load time, so scaling its matrices does
+    not scale its effect linearly — the baked file would drift from the preview arithmetic. Dropping
+    ([0]) and keeping ([1]) stay available; only in-between values are refused.
+    """
+    if module.is_dora:
+        raise UnsupportedLoRA(
+            f"{block_id} carries DoRA weights ({module.name}). A DoRA contribution does not scale "
+            f"linearly, so a partial strength would not do what the slider says. Set this block to "
+            f"0 or 1, or edit a non-DoRA export of the LoRA.")
+
+
+def _scaled_lycoris(out: dict, module: LoraModule, multiplier: float) -> None:
+    """Bake a multiplier into a LoKR/LoHa module in its native format — exact, no SVD.
+
+    Both forms are linear in their first factor, so the multiplier folds into `lokr_w1` (or
+    `lokr_w1_a` / `hada_w1_a`) the way the standard bake folds into `lora_up`:
+    kron(m·w1, w2) = m·kron(w1, w2), and (m·W1) ∘ W2 = m·(W1 ∘ W2).
+
+    Unlike the standard path, alpha is left exactly as it was. Folding the scale in too would need
+    a sentinel alpha for loaders to interpret (Fizgig writes 1e10), and not every loader knows that
+    convention — with alpha untouched, anything that read the original correctly reads the edit
+    correctly, and an untouched module stays byte-identical.
+    """
+    first = module.first_factor_name()
+    for suffix, tensor in module.tensors.items():
+        if suffix == first:
+            edited = (tensor.to(torch.float32) * multiplier).to(tensor.dtype)
+            out[f"{module.name}.{suffix}"] = edited
+        else:
+            out[f"{module.name}.{suffix}"] = tensor
+
+
 def _emit(out: dict, module: LoraModule, up: torch.Tensor, down: torch.Tensor, rank: int) -> None:
     """Write one module under the names it came in with, at an effective scale of exactly 1.0."""
     out[f"{module.name}.{module.up_suffix()}"] = up
@@ -230,11 +278,29 @@ def bake(
                 for suffix, tensor in decision.primary.tensors.items():
                     out[f"{decision.name}.{suffix}"] = tensor
             case "blend":
+                if decision.primary.is_lycoris or decision.donor.is_lycoris:
+                    # rank concatenation needs the two-matrix form; blending a Kronecker or
+                    # Hadamard block would mean a lossy SVD conversion, which this tab does not do
+                    raise UnsupportedLoRA(
+                        f"{decision.block_id} is a LoKR/LoHa block ({decision.name}), and blending "
+                        f"one with a donor cannot be done exactly. Set one side of this block to "
+                        f"zero, or use a standard-LoRA export for the blend.")
+                _guard_editable(decision.primary, decision.block_id)
+                _guard_editable(decision.donor, decision.block_id)
                 _emit(out, decision.primary, *_blend(decision))
             case "donor":
-                _emit(out, decision.donor, *_weighted(decision.donor, decision.donor_strength))
+                _guard_editable(decision.donor, decision.block_id)
+                if decision.donor.is_lycoris:
+                    _scaled_lycoris(out, decision.donor, decision.donor_strength)
+                else:
+                    _emit(out, decision.donor, *_weighted(decision.donor, decision.donor_strength))
             case _:
-                _emit(out, decision.primary, *_weighted(decision.primary, decision.primary_strength))
+                _guard_editable(decision.primary, decision.block_id)
+                if decision.primary.is_lycoris:
+                    _scaled_lycoris(out, decision.primary, decision.primary_strength)
+                else:
+                    _emit(out, decision.primary,
+                          *_weighted(decision.primary, decision.primary_strength))
 
     summary = summarise(decisions, keys_out=len(out), out_path=out_path)
     summary.keys_in = (sum(len(m.tensors) for m in primary.modules.values())
@@ -277,8 +343,6 @@ def effective_delta(module: LoraModule, multiplier: float) -> torch.Tensor:
 
     Exists so a test can check a baked file against the thing it is supposed to be equivalent to,
     which is the only claim in this file worth verifying by measurement rather than by reading.
+    Works for every form the studio edits: `delta()` densifies standard, LoKR and LoHa alike.
     """
-    up, down = module.up, module.down
-    flat_up = up.float().reshape(up.shape[0], -1)
-    flat_down = down.float().reshape(down.shape[0], -1)
-    return (flat_up @ flat_down) * module.scale * multiplier
+    return module.delta() * multiplier

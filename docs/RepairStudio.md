@@ -95,11 +95,35 @@ you made six months ago can tell you what you did to it.
   hash that is no longer its own.
 * **Rewritten:** `ss_network_dim` and `ss_network_alpha`, because a donor blend changes both.
 
+## LyCORIS: LoKR and LoHa edit exactly, in native format
+
+Both LyCORIS forms are *linear in their first factor*:
+
+```
+LoKR:  kron(m·w1, w2)      = m · kron(w1, w2)
+LoHa:  (m·W1) ∘ W2         = m · (W1 ∘ W2)
+```
+
+So a per-block multiplier folds into `lokr_w1` (or `lokr_w1_a` / `hada_w1_a`) the same way the
+standard bake folds into `lora_up` — exactly, with no SVD and no format conversion. A module you
+did not touch comes out **byte-identical**, alpha included, and OneTrainer's own LoKr exports open
+like any other LoRA.
+
+One deliberate difference from Fizgig: alpha is left untouched rather than replaced with a
+"scale already baked" sentinel value. The sentinel needs the loader to know the convention; with
+alpha as it was, anything that read the original correctly reads the edit correctly.
+
+Three things stay refused, each with a message saying why:
+
+* **Donor-blending a LoKR/LoHa block** — rank concatenation needs the two-matrix form, so an exact
+  blend does not exist. Set one side of the block to zero, or blend standard-LoRA exports.
+* **Tucker-decomposed modules** (`lokr_t2`) — the core tensor breaks the linearity the exact bake
+  relies on.
+* **Partial strengths on DoRA blocks** — a DoRA delta is renormalised at load time, so scaling its
+  matrices does not scale its effect; the slider would lie. `[0]` and `[1]` still work.
+
 ## Limits
 
-* **LyCORIS (LoKR / LoHa) is refused.** Those forms cannot be rescaled per block without an SVD
-  approximation. Fizgig will do that and tell you; here the file simply does not open, on the grounds
-  that a tab whose whole promise is "exact" should not quietly hand you something that isn't.
 * **No preview yet.** Fizgig shows a live side-by-side render as you drag. That needs a base model
   resident in VRAM and OneTrainer supports a lot more architectures than Fizgig does, so it is a
   separate piece of work. For now the workflow is: edit, bake, look at it in your sampler of choice.

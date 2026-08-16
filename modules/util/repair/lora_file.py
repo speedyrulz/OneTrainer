@@ -54,9 +54,22 @@ def split_key(key: str) -> tuple[str, str] | None:
     return None
 
 
+# Alpha values at or above this are a sentinel some tools (Fizgig, Comfy-Realtime-Lora) write into
+# LyCORIS files to mean "the scale is already baked into the weights". Files like that exist in the
+# wild; misreading one would rescale its whole delta by alpha/dim.
+ALPHA_SENTINEL = 1e8
+
+
 @dataclass
 class LoraModule:
-    """One adapted layer: its two matrices, its scale, and anything else stored alongside."""
+    """One adapted layer: its matrices, its scale, and anything else stored alongside.
+
+    Covers the standard two-matrix form and the two LyCORIS forms whose delta is *linear in the
+    first factor*, which is what makes exact per-block editing possible without SVD:
+
+        LoKR:  delta = scale · kron(w1, w2)      (w1, w2 optionally factored as a @ b)
+        LoHa:  delta = scale · (w1a@w1b ∘ w2a@w2b)
+    """
 
     name: str
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -85,25 +98,95 @@ class LoraModule:
         return any(name.startswith(("lokr_", "hada_")) for name in self.tensors)
 
     @property
+    def lycoris_kind(self) -> str | None:
+        """"lokr", "loha", or None — which LyCORIS form this module stores."""
+        if any(name.startswith("lokr_") for name in self.tensors):
+            return "lokr"
+        if any(name.startswith("hada_") for name in self.tensors):
+            return "loha"
+        return None
+
+    @property
+    def is_tucker(self) -> bool:
+        """A Tucker-decomposed module carries a core tensor the linear-factor bake cannot honour."""
+        return any(name.startswith(("lokr_t", "hada_t")) for name in self.tensors)
+
+    @property
+    def is_dora(self) -> bool:
+        return "dora_scale" in self.tensors
+
+    def lycoris_complete(self) -> bool:
+        """Whether both halves of the LyCORIS decomposition are actually in the file."""
+        match self.lycoris_kind:
+            case "lokr":
+                w1 = self.tensors.get("lokr_w1") is not None or (
+                    self.tensors.get("lokr_w1_a") is not None
+                    and self.tensors.get("lokr_w1_b") is not None)
+                w2 = self.tensors.get("lokr_w2") is not None or (
+                    self.tensors.get("lokr_w2_a") is not None
+                    and self.tensors.get("lokr_w2_b") is not None)
+                return w1 and w2
+            case "loha":
+                return all(self.tensors.get(f"hada_w{i}_{half}") is not None
+                           for i in (1, 2) for half in ("a", "b"))
+            case _:
+                return False
+
+    def first_factor_name(self) -> str:
+        """The tensor an exact per-block multiplier folds into.
+
+        Both LyCORIS forms are linear in their first factor: kron(m·w1, w2) = m·kron(w1, w2) and
+        (m·W1) ∘ W2 = m·(W1 ∘ W2). For standard LoRA it is `lora_up`, matching the existing bake.
+        """
+        if self.lycoris_kind == "lokr":
+            return "lokr_w1_a" if "lokr_w1_a" in self.tensors else "lokr_w1"
+        if self.lycoris_kind == "loha":
+            return "hada_w1_a"
+        return self.up_suffix()
+
+    @property
     def rank(self) -> int:
         down = self.down
         return int(down.shape[0]) if down is not None else 0
 
     @property
     def alpha(self) -> float:
-        """The stored alpha, or the rank when there is none — both mean a scale of 1.0."""
+        """The stored alpha; without one, whatever value makes the scale come out as 1.0."""
         alpha = self.tensors.get("alpha")
         if alpha is None:
-            return float(self.rank)
+            return 1.0 if self.is_lycoris else float(self.rank)
         try:
             return float(alpha.item())
         except Exception:
-            return float(self.rank)
+            return 1.0 if self.is_lycoris else float(self.rank)
 
     @property
     def scale(self) -> float:
-        """alpha / rank — what inference multiplies this module's output by."""
-        return self.alpha / max(self.rank, 1)
+        """What inference multiplies this module's delta by.
+
+        Standard LoRA: alpha / rank. LyCORIS: alpha over the smallest decomposition rank actually
+        in use, mirroring LyCORIS's own inference modules — a divergent convention here silently
+        rescales the whole file. A sentinel alpha means the scale is already in the weights.
+        """
+        kind = self.lycoris_kind
+        if kind is None:
+            return self.alpha / max(self.rank, 1)
+
+        if self.alpha >= ALPHA_SENTINEL:
+            return 1.0
+
+        if kind == "loha":
+            r1 = int(self.tensors["hada_w1_a"].shape[1])
+            r2 = int(self.tensors["hada_w2_a"].shape[1])
+            return self.alpha / max(1, min(r1, r2))
+
+        # LoKR: the dims of whichever halves are factored; a full-matrix LoKR has dim 1
+        dims = []
+        if self.tensors.get("lokr_w1_a") is not None:
+            dims.append(int(self.tensors["lokr_w1_a"].shape[1]))
+        if self.tensors.get("lokr_w2_a") is not None:
+            dims.append(int(self.tensors["lokr_w2_a"].shape[1]))
+        return self.alpha / (max(1, min(dims)) if dims else 1)
 
     def down_suffix(self) -> str:
         return next(s for s in DOWN_SUFFIXES if s in self.tensors)
@@ -111,14 +194,39 @@ class LoraModule:
     def up_suffix(self) -> str:
         return next(s for s in UP_SUFFIXES if s in self.tensors)
 
+    def _lokr_halves(self) -> tuple[torch.Tensor, torch.Tensor]:
+        def half(full_name: str, a_name: str, b_name: str) -> torch.Tensor:
+            full = self.tensors.get(full_name)
+            if full is not None:
+                return full.float()
+            return self.tensors[a_name].float() @ self.tensors[b_name].float()
+
+        return (half("lokr_w1", "lokr_w1_a", "lokr_w1_b"),
+                half("lokr_w2", "lokr_w2_a", "lokr_w2_b"))
+
     def delta(self) -> torch.Tensor:
         """The weight change this module applies at strength 1.0, as a dense matrix.
 
         Only used to check a bake against what it replaced — it is the expensive form, which is the
-        whole reason LoRAs are stored as two matrices.
+        whole reason these decompositions exist. Convolution kernels are flattened into columns; a
+        kron of the flattened halves equals the flattened kron, so the check stays exact.
         """
-        up, down = self.up, self.down
-        return (up.float().reshape(up.shape[0], -1) @ down.float().reshape(down.shape[0], -1)) * self.scale
+        match self.lycoris_kind:
+            case "lokr":
+                w1, w2 = self._lokr_halves()
+                w1 = w1.reshape(w1.shape[0], -1)
+                w2 = w2.reshape(w2.shape[0], -1)
+                return torch.kron(w1, w2) * self.scale
+            case "loha":
+                first = (self.tensors["hada_w1_a"].float()
+                         @ self.tensors["hada_w1_b"].float().reshape(self.tensors["hada_w1_b"].shape[0], -1))
+                second = (self.tensors["hada_w2_a"].float()
+                          @ self.tensors["hada_w2_b"].float().reshape(self.tensors["hada_w2_b"].shape[0], -1))
+                return first * second * self.scale
+            case _:
+                up, down = self.up, self.down
+                return (up.float().reshape(up.shape[0], -1)
+                        @ down.float().reshape(down.shape[0], -1)) * self.scale
 
 
 @dataclass
@@ -188,18 +296,20 @@ def load(path: str) -> LoraFile:
             f"{os.path.basename(path)} has no LoRA weights in it — no lora_down/lora_up or "
             f"lora_A/lora_B keys were found.")
 
-    lycoris = [m.name for m in modules.values() if m.is_lycoris]
-    if lycoris:
+    tucker = [m.name for m in modules.values() if m.is_tucker]
+    if tucker:
         raise UnsupportedLoRA(
-            f"{os.path.basename(path)} is a LyCORIS LoRA ({len(lycoris)} LoKR/LoHa modules). Those "
-            f"cannot be rescaled per block without an SVD approximation, so the studio does not "
-            f"open them rather than hand you a file that is quietly not what it says it is.")
+            f"{os.path.basename(path)} uses Tucker-decomposed LoKR ({len(tucker)} module(s), "
+            f"starting with {tucker[0]}). That form carries a core tensor the exact per-block bake "
+            f"cannot honour, so the studio does not open it rather than hand you a file that is "
+            f"quietly not what it says it is.")
 
-    odd = [m.name for m in modules.values() if not m.is_standard]
+    odd = [m.name for m in modules.values()
+           if not m.is_standard and not (m.is_lycoris and m.lycoris_complete())]
     if odd:
         raise UnsupportedLoRA(
-            f"{os.path.basename(path)} has {len(odd)} module(s) with only one of the two LoRA "
-            f"matrices, starting with {odd[0]}. The file looks truncated.")
+            f"{os.path.basename(path)} has {len(odd)} module(s) missing half of their "
+            f"decomposition, starting with {odd[0]}. The file looks truncated.")
 
     return LoraFile(
         path=path,

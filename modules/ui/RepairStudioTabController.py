@@ -107,11 +107,16 @@ class RepairStudioTabController:
                     f"trained on different models, so there is nothing to blend.")
 
         for name in sorted(shared):
-            primary_up = self.primary.modules[name].up
-            donor_up = self.donor.modules[name].up
-            if primary_up.shape[0] != donor_up.shape[0]:
+            primary_module = self.primary.modules[name]
+            donor_module = self.donor.modules[name]
+            if not (primary_module.is_standard and donor_module.is_standard):
+                # a LoKR/LoHa module cannot be blended anyway (the bake refuses it exactly),
+                # so shape-checking it here would only block loading a donor whose standard
+                # blocks are perfectly usable
+                continue
+            if primary_module.up.shape[0] != donor_module.up.shape[0]:
                 return (f"{self.donor.name} does not match {self.primary.name}: {name} is shaped "
-                        f"{tuple(donor_up.shape)} against {tuple(primary_up.shape)}.")
+                        f"{tuple(donor_module.up.shape)} against {tuple(primary_module.up.shape)}.")
         return None
 
     @property
@@ -153,11 +158,18 @@ class RepairStudioTabController:
         if self.primary is None:
             return "Open a LoRA to edit its blocks."
 
-        low, high = self.primary.rank_range
-        rank = f"rank {low}" if low == high else f"rank {low}-{high}"
         blocks = len(self.blocks())
-        return (f"{self.primary.name} — {blocks} block(s), {len(self.primary.modules)} layers, "
-                f"{rank}")
+        summary = f"{self.primary.name} — {blocks} block(s), {len(self.primary.modules)} layers"
+
+        low, high = self.primary.rank_range
+        if high:
+            summary += f", rank {low}" if low == high else f", rank {low}-{high}"
+
+        kinds = sorted({m.lycoris_kind for m in self.primary.modules.values() if m.lycoris_kind})
+        if kinds:
+            names = {"lokr": "LoKR", "loha": "LoHa"}
+            summary += ", " + "/".join(names.get(k, k) for k in kinds)
+        return summary
 
     def donor_summary(self) -> str:
         if self.donor is None:
