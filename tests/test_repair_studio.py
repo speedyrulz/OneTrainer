@@ -1078,3 +1078,88 @@ def test_a_dora_block_at_full_strength_keeps_its_dora_scale(tmp_path):
     name = FLUX_MODULES[0]  # an untouched block
     assert torch.equal(load_file(source)[f"{name}.dora_scale"], baked[f"{name}.dora_scale"])
     assert not any(k.startswith("lora_unet_single_blocks_0_") for k in baked)
+
+
+# --- the preview panel, in both UI frameworks -----------------------------------------------------
+
+
+def krea2_config():
+    from modules.util.config.TrainConfig import TrainConfig
+    from modules.util.enum.ModelType import ModelType
+
+    config = TrainConfig.default_values()
+    config.model_type = ModelType.KREA_2
+    config.base_model_name = "some/model"
+    return config
+
+
+def test_ctk_the_preview_panel_is_built(ctk_root):
+    import customtkinter as ctk
+
+    frame = ctk.CTkFrame(ctk_root)
+    from modules.ui.CtkRepairStudioTabView import CtkRepairStudioTabView
+
+    tab = CtkRepairStudioTabView(frame, RepairStudioTabController(krea2_config()))
+
+    assert tab.preview_prompt is not None
+    assert set(tab.preview_fields) == {"seed", "steps", "width", "height"}
+    assert tab.preview_baseline_label.cget("text") == "baseline"
+
+
+def test_ctk_the_wrong_model_type_reports_in_the_panel(ctk_root, flux_lora):
+    from modules.util.enum.ModelType import ModelType
+
+    import customtkinter as ctk
+
+    config = krea2_config()
+    config.model_type = ModelType.STABLE_DIFFUSION_15
+    frame = ctk.CTkFrame(ctk_root)
+    from modules.ui.CtkRepairStudioTabView import CtkRepairStudioTabView
+
+    tab = CtkRepairStudioTabView(frame, RepairStudioTabController(config))
+    tab.load_primary(flux_lora)
+    tab._CtkRepairStudioTabView__load_preview_clicked()
+
+    assert "Krea 2" in tab.preview_status.cget("text")
+
+
+def test_ctk_render_before_load_reports_in_the_panel(ctk_root):
+    import customtkinter as ctk
+
+    frame = ctk.CTkFrame(ctk_root)
+    from modules.ui.CtkRepairStudioTabView import CtkRepairStudioTabView
+
+    tab = CtkRepairStudioTabView(frame, RepairStudioTabController(krea2_config()))
+    tab._CtkRepairStudioTabView__start_render()
+
+    assert "Load the preview model" in tab.preview_status.cget("text")
+
+
+def test_qt_the_preview_panel_is_built(qt_app):
+    from modules.ui.PySide6RepairStudioTabView import PySide6RepairStudioTabView
+
+    tab = PySide6RepairStudioTabView(None, RepairStudioTabController(krea2_config()))
+
+    assert tab.preview_prompt is not None
+    assert set(tab.preview_fields) == {"seed", "steps", "width", "height"}
+    assert tab.preview_baseline_label.text() == "baseline"
+
+
+def test_qt_render_before_load_reports_in_the_panel(qt_app):
+    from modules.ui.PySide6RepairStudioTabView import PySide6RepairStudioTabView
+
+    tab = PySide6RepairStudioTabView(None, RepairStudioTabController(krea2_config()))
+    tab._PySide6RepairStudioTabView__start_render()
+
+    assert "Load the preview model" in tab.preview_status.text()
+
+
+def test_qt_the_pixmap_conversion_round_trips(qt_app):
+    from modules.ui.PySide6RepairStudioTabView import _pil_to_pixmap
+
+    from PIL import Image as PILImage
+
+    pixmap = _pil_to_pixmap(PILImage.new("RGB", (32, 16), (200, 30, 30)))
+
+    assert pixmap.width() == 32
+    assert pixmap.height() == 16

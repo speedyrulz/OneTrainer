@@ -74,6 +74,8 @@ A new **repair studio** tab (ported from Fizgig) for editing a finished LoRA per
 -   **Donor blending** by exact rank concatenation — no SVD, no approximation
 -   Saves a baked `.safetensors` that runs at strength 1.0 in ComfyUI and anywhere else, verified
     by measurement against the weighted sum it replaces
+-   **Live preview (Krea 2)**: side-by-side baseline vs current-sliders renders on the real base
+    model, applied through forward hooks so what you see is exactly what the bake writes
 
 ### Automagic3 optimizer — [docs](docs/Automagic3.md)
 

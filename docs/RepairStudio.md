@@ -122,8 +122,39 @@ Three things stay refused, each with a message saying why:
 * **Partial strengths on DoRA blocks** — a DoRA delta is renormalised at load time, so scaling its
   matrices does not scale its effect; the slider would lie. `[0]` and `[1]` still work.
 
+## The live preview (Krea 2)
+
+When the model tab is set to a **Krea 2** model, the tab can render what the sliders currently mean.
+**Load preview model** brings the base model in (through OneTrainer's own loader, with whatever
+weight dtypes and quantization the model tab says); two panes then show the **baseline** — every
+block at its trained strength, i.e. what the LoRA is — beside the **current sliders**. Set a prompt,
+seed, steps and size, press **Render**, or tick **Re-render on change** to re-render half a second
+after a slider stops moving.
+
+How it works, and why you can trust it:
+
+* The LoRA is applied by **forward hooks**, not by patching weights — each hooked layer adds its
+  module's delta scaled by the block's live slider value. Moving a slider changes the next render
+  with nothing re-attached, and unloading restores the base model bit-exactly because it was never
+  written to.
+* **What you see is what the bake writes.** A test drives the same slider state through the hooks
+  and through a real bake, and the two outputs match to float precision. The preview is not an
+  approximation of the file; it is the file, rendered early.
+* LoKR modules are applied through the **Kronecker identity** — the dense delta is never built, so
+  a full-size LoKR previews without a VRAM spike. LoHa has no such identity (a Hadamard product
+  does not factor through matmul), so LoHa previews only under a ~1GB dense budget and says so
+  otherwise.
+* The panel reports how many of the file's layers matched the loaded model (`primary: 380/380
+  layers hooked`) — a partial match means the render is not showing the whole file, and that is
+  worth knowing rather than guessing.
+
+Each render is a full sampling pass — seconds, not frames. Fizgig's Turbo activation caching (which
+makes late-block edits much faster) is the natural next step on top of this, not part of it.
+
 ## Limits
 
-* **No preview yet.** Fizgig shows a live side-by-side render as you drag. That needs a base model
-  resident in VRAM and OneTrainer supports a lot more architectures than Fizgig does, so it is a
-  separate piece of work. For now the workflow is: edit, bake, look at it in your sampler of choice.
+* **The preview is Krea 2 only for now.** Other model families still work fully for editing and
+  baking — the workflow there is: edit, bake, look at it in your sampler of choice. The
+  `Krea2PreviewEngine.supports()` gate is where the next family gets added.
+* **Donor previews read the donor sliders**, but a donor whose blocks you never touch adds render
+  cost for nothing — clear it if you are only editing the primary.

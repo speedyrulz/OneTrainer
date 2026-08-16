@@ -34,12 +34,18 @@ class CtkRepairStudioTabView:
         master.grid_rowconfigure(1, weight=1)
         master.grid_columnconfigure(0, weight=1)
 
+        self._render_busy = False
+        self._render_pending = False
+        self._auto_job = None
+        self._preview_images: list = []
+
         self.__build_header()
 
         self.scroll_frame = ctk.CTkScrollableFrame(master, fg_color="transparent")
         self.scroll_frame.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
         self.scroll_frame.grid_columnconfigure(0, weight=1)
 
+        self.__build_preview()
         self.__build_footer()
         self.refresh()
 
@@ -90,9 +96,164 @@ class CtkRepairStudioTabView:
         ctk.CTkButton(tools, text="Save preset", width=100, command=self.__save_preset) \
             .grid(row=0, column=7, padx=2)
 
+    def __build_preview(self):
+        """The live render: baseline (as trained) beside the sliders' current meaning."""
+        panel = ctk.CTkFrame(self.master)
+        panel.grid(row=2, column=0, sticky="sew", padx=6, pady=(0, 4))
+        panel.grid_columnconfigure(1, weight=1)
+
+        buttons = ctk.CTkFrame(panel, fg_color="transparent")
+        buttons.grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        self.preview_load_button = ctk.CTkButton(buttons, text="Load preview model", width=140,
+                                                 command=self.__load_preview_clicked)
+        self.preview_load_button.grid(row=0, column=0, padx=(0, 4))
+        ToolTip(self.preview_load_button,
+                "Loads the model tab's base model so the sliders can render live. Krea 2 only for "
+                "now, and it holds the model in VRAM until unloaded.", wide=True)
+        ctk.CTkButton(buttons, text="Unload", width=70, command=self.__unload_preview_clicked) \
+            .grid(row=0, column=1)
+
+        self.preview_status = ctk.CTkLabel(panel, text="", anchor="w", justify="left")
+        self.preview_status.grid(row=0, column=1, columnspan=3, sticky="ew", padx=6)
+
+        ctk.CTkLabel(panel, text="Prompt", width=60, anchor="w").grid(row=1, column=0, padx=6)
+        self.preview_prompt = ctk.CTkEntry(panel)
+        self.preview_prompt.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6, pady=2)
+
+        controls = ctk.CTkFrame(panel, fg_color="transparent")
+        controls.grid(row=2, column=0, columnspan=4, sticky="ew", padx=6, pady=(2, 4))
+        self.preview_fields = {}
+        for index, (label, default, width) in enumerate((
+                ("Seed", "42", 70), ("Steps", "20", 45), ("Width", "512", 55), ("Height", "512", 55))):
+            ctk.CTkLabel(controls, text=label).grid(row=0, column=index * 2, padx=(8, 2))
+            entry = ctk.CTkEntry(controls, width=width)
+            entry.insert(0, default)
+            entry.grid(row=0, column=index * 2 + 1)
+            self.preview_fields[label.lower()] = entry
+
+        ctk.CTkButton(controls, text="Render", width=80, command=self.__start_render) \
+            .grid(row=0, column=8, padx=(12, 4))
+        self.preview_auto = ctk.CTkCheckBox(controls, text="Re-render on change")
+        self.preview_auto.grid(row=0, column=9, padx=4)
+        ToolTip(self.preview_auto, "Render again half a second after a slider stops moving. Each "
+                                   "render is a full sampling pass, so expect seconds, not frames.",
+                wide=True)
+
+        images = ctk.CTkFrame(panel, fg_color="transparent")
+        images.grid(row=3, column=0, columnspan=4, padx=6, pady=(0, 6))
+        self.preview_baseline_label = ctk.CTkLabel(images, text="baseline", width=300, height=300)
+        self.preview_baseline_label.grid(row=0, column=0, padx=4)
+        self.preview_edited_label = ctk.CTkLabel(images, text="current sliders", width=300, height=300)
+        self.preview_edited_label.grid(row=0, column=1, padx=4)
+
+    # --- preview plumbing ------------------------------------------------------------------------
+
+    def __preview_status_set(self, message: str, error: bool = False):
+        self.preview_status.configure(text=message, text_color="#dc3545" if error else "gray70")
+
+    def __load_preview_clicked(self):
+        reason = self.controller.preview_supported()
+        if reason:
+            self.__preview_status_set(reason, error=True)
+            return
+        self.__preview_status_set("Loading the preview model — this takes a while...")
+        self.preview_load_button.configure(state="disabled")
+
+        def worker():
+            error = self.controller.load_preview()
+            summary = self.controller.preview_match_summary()
+
+            def done():
+                self.preview_load_button.configure(state="normal")
+                if error:
+                    self.__preview_status_set(error, error=True)
+                else:
+                    self.__preview_status_set(f"Model loaded · {summary}" if summary else "Model loaded")
+            self.master.after(0, done)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def __unload_preview_clicked(self):
+        self.controller.unload_preview()
+        self.__preview_status_set("Preview model unloaded.")
+
+    def __preview_settings(self):
+        from modules.util.repair.preview_engine import PreviewSettings
+
+        def integer(name, fallback):
+            try:
+                return int(self.preview_fields[name].get().strip())
+            except (KeyError, ValueError):
+                return fallback
+
+        return PreviewSettings(
+            prompt=self.preview_prompt.get(),
+            seed=integer("seed", 42),
+            steps=integer("steps", 20),
+            width=integer("width", 512),
+            height=integer("height", 512),
+        )
+
+    def __start_render(self):
+        if not self.controller.preview_loaded:
+            self.__preview_status_set("Load the preview model first.", error=True)
+            return
+        if self._render_busy:
+            # remember that the sliders moved again; one more render follows the current one
+            self._render_pending = True
+            return
+        self._render_busy = True
+        self.__preview_status_set("Rendering...")
+        settings = self.__preview_settings()
+
+        def worker():
+            try:
+                baseline, edited = self.controller.render_preview(settings)
+                error = None
+            except Exception as e:
+                baseline = edited = None
+                error = str(e)
+
+            def done():
+                self._render_busy = False
+                if error:
+                    self.__preview_status_set(error, error=True)
+                else:
+                    self.__show_preview(baseline, edited)
+                    self.__preview_status_set("")
+                if self._render_pending:
+                    self._render_pending = False
+                    self.__start_render()
+            self.master.after(0, done)
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def __show_preview(self, baseline, edited):
+        self._preview_images = []
+        for image, label in ((baseline, self.preview_baseline_label),
+                             (edited, self.preview_edited_label)):
+            shown = image.copy()
+            shown.thumbnail((300, 300))
+            ctk_image = ctk.CTkImage(light_image=shown, dark_image=shown, size=shown.size)
+            self._preview_images.append(ctk_image)
+            label.configure(image=ctk_image, text="")
+
+    def __schedule_auto_render(self):
+        if not self.preview_auto.get() or not self.controller.preview_loaded:
+            return
+        if self._auto_job is not None:
+            self.master.after_cancel(self._auto_job)
+        self._auto_job = self.master.after(500, self.__auto_render_fire)
+
+    def __auto_render_fire(self):
+        self._auto_job = None
+        self.__start_render()
+
     def __build_footer(self):
         footer = ctk.CTkFrame(self.master)
-        footer.grid(row=2, column=0, sticky="sew", padx=6, pady=(0, 6))
+        footer.grid(row=3, column=0, sticky="sew", padx=6, pady=(0, 6))
         footer.grid_columnconfigure(1, weight=1)
 
         self.summary_label = ctk.CTkLabel(footer, text="", anchor="w", justify="left")
@@ -202,18 +363,21 @@ class CtkRepairStudioTabView:
         self.controller.set_strength(block_id, float(value), donor=donor)
         self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __quick_set(self, block_id: str, action: str, *, donor: bool):
         self.controller.apply(action, block_id, donor=donor)
         # balance moves the *other* side, so the whole row is resynced either way
         self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __quick_set_all(self, action: str):
         self.controller.apply(action)
         for block_id in self.rows:
             self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __sync_row(self, block_id: str):
         """Push the state back into the widgets, without rebuilding them."""
@@ -246,6 +410,7 @@ class CtkRepairStudioTabView:
         _set(self.donor_entry, self.controller.state.donor_path)
         _set(self.output_entry, self.controller.default_output_path())
         self.refresh()
+        self.controller.sync_preview_files()
         self.__status(error or "", error=bool(error))
 
     def __browse_donor(self):
@@ -257,12 +422,14 @@ class CtkRepairStudioTabView:
         error = self.controller.load_donor(path)
         _set(self.donor_entry, "" if error else path)
         self.refresh()
+        self.controller.sync_preview_files()
         self.__status(error or "", error=bool(error))
 
     def __clear_donor(self):
         self.controller.load_donor("")
         _set(self.donor_entry, "")
         self.refresh()
+        self.controller.sync_preview_files()
 
     def __save(self):
         error, message = self.controller.save(self.output_entry.get().strip())

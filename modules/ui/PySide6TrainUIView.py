@@ -295,7 +295,8 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         self.tabview.addTab(tools_page, "tools")
         self._tab_widgets["tools"] = tools_page
 
-        self.repair_studio_tab = PySide6RepairStudioTabView(None, RepairStudioTabController())
+        self.repair_studio_tab = PySide6RepairStudioTabView(
+            None, RepairStudioTabController(self.controller.train_config))
         self.tabview.addTab(self.repair_studio_tab, "repair studio")
         self._tab_widgets["repair studio"] = self.repair_studio_tab
 

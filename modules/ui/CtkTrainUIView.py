@@ -307,7 +307,7 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         return CtkTrainingTabView(master, TrainingTabController(self.controller.train_config), self.ui_state)
 
     def create_repair_studio_tab(self, master) -> CtkRepairStudioTabView:
-        return CtkRepairStudioTabView(master, RepairStudioTabController())
+        return CtkRepairStudioTabView(master, RepairStudioTabController(self.controller.train_config))
 
     def create_multi_config_tab(self, master) -> CtkMultiConfigTabView:
         return CtkMultiConfigTabView(master, MultiConfigTabController(self.controller.train_config), self.ui_state)

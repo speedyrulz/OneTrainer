@@ -30,11 +30,16 @@ GROUP_LABELS = {
 
 
 class RepairStudioTabController:
-    def __init__(self):
+    def __init__(self, train_config=None):
         self.primary: LoraFile | None = None
         self.donor: LoraFile | None = None
         self.state = SliderState()
         self.error: str | None = None
+
+        # the training config supplies the preview's base model; without one the tab still edits
+        # and bakes, it just cannot render
+        self.train_config = train_config
+        self.preview_engine = None
 
     # --- loading ------------------------------------------------------------------------------
 
@@ -244,6 +249,71 @@ class RepairStudioTabController:
         except Exception as e:
             return f"Could not save the preset: {e}"
         return None
+
+    # --- the live preview ------------------------------------------------------------------------
+
+    def preview_supported(self) -> str | None:
+        """None when the preview can run, else the reason it cannot."""
+        if self.train_config is None:
+            return "The preview needs the training config for a base model."
+        from modules.util.repair.preview_engine import Krea2PreviewEngine
+
+        return Krea2PreviewEngine.supports(self.train_config)
+
+    @property
+    def preview_loaded(self) -> bool:
+        return self.preview_engine is not None and self.preview_engine.loaded
+
+    def load_preview(self) -> str | None:
+        """Load the base model and hook the open files onto it. Slow — call off the UI thread."""
+        reason = self.preview_supported()
+        if reason:
+            return reason
+        if self.primary is None:
+            return "Open a LoRA first — the preview shows the file being edited."
+
+        if self.preview_engine is None:
+            from modules.util.repair.preview_engine import Krea2PreviewEngine
+
+            self.preview_engine = Krea2PreviewEngine(self.train_config)
+
+        error = self.preview_engine.load()
+        if error:
+            return error
+        return self.preview_engine.attach(self.primary, self.donor, self.state)
+
+    def unload_preview(self) -> None:
+        if self.preview_engine is not None:
+            self.preview_engine.unload()
+
+    def sync_preview_files(self) -> str | None:
+        """Re-hook after the primary or donor changed. No-op while the model is not loaded."""
+        if not self.preview_loaded:
+            return None
+        if self.primary is None:
+            self.preview_engine.unload()
+            return None
+        return self.preview_engine.attach(self.primary, self.donor, self.state)
+
+    def render_preview(self, settings):
+        """(baseline, edited) as PIL images at the sliders' current strengths. Slow — off the UI
+        thread. Raises with a readable message when it cannot render."""
+        if not self.preview_loaded:
+            raise RuntimeError("Load the preview model first.")
+        baseline = self.preview_engine.render_baseline(self.state, settings)
+        edited = self.preview_engine.render(self.state, settings)
+        return baseline, edited
+
+    def preview_match_summary(self) -> str:
+        if self.preview_engine is None:
+            return ""
+        return self.preview_engine.match_summary()
+
+    def close_preview(self) -> None:
+        """Release everything the preview holds. Safe to call repeatedly."""
+        if self.preview_engine is not None:
+            self.preview_engine.unload()
+            self.preview_engine = None
 
     def load_preset(self, path: str) -> str | None:
         try:

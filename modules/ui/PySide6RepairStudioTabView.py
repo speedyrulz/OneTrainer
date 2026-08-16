@@ -9,8 +9,10 @@ import os
 
 from modules.ui.RepairStudioTabController import RepairStudioTabController
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -36,11 +38,25 @@ QUICK_SETS = [
 
 
 class PySide6RepairStudioTabView(QWidget):
+    # worker threads emit these; the connected slots run on the UI thread
+    _preview_loaded = Signal(str)          # error message, or ""
+    _preview_rendered = Signal(object, object, str)  # baseline, edited, error
+
     def __init__(self, parent, controller: RepairStudioTabController):
         super().__init__(parent)
 
         self.controller = controller
         self.rows: dict[str, dict] = {}
+        self._render_busy = False
+        self._render_pending = False
+
+        self._preview_loaded.connect(self.__on_preview_loaded)
+        self._preview_rendered.connect(self.__on_preview_rendered)
+
+        self._auto_timer = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.setInterval(500)
+        self._auto_timer.timeout.connect(self.__start_render)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.__build_header())
@@ -54,6 +70,7 @@ class PySide6RepairStudioTabView(QWidget):
         self.container_layout.addStretch(1)
         self.scroll.setWidget(self.container)
 
+        layout.addWidget(self.__build_preview())
         layout.addWidget(self.__build_footer())
         self.refresh()
 
@@ -117,6 +134,163 @@ class PySide6RepairStudioTabView(QWidget):
         grid.addWidget(tools, 4, 0, 1, 3)
 
         return header
+
+    def __build_preview(self) -> QWidget:
+        """The live render: baseline (as trained) beside the sliders' current meaning."""
+        panel = QFrame()
+        panel.setFrameShape(QFrame.Shape.StyledPanel)
+        grid = QGridLayout(panel)
+        grid.setColumnStretch(1, 1)
+
+        buttons = QWidget()
+        buttons_row = QHBoxLayout(buttons)
+        buttons_row.setContentsMargins(0, 0, 0, 0)
+        self.preview_load_button = QPushButton("Load preview model")
+        self.preview_load_button.setToolTip(
+            "Loads the model tab's base model so the sliders can render live. Krea 2 only for "
+            "now, and it holds the model in VRAM until unloaded.")
+        self.preview_load_button.clicked.connect(self.__load_preview_clicked)
+        buttons_row.addWidget(self.preview_load_button)
+        unload = QPushButton("Unload")
+        unload.clicked.connect(self.__unload_preview_clicked)
+        buttons_row.addWidget(unload)
+        grid.addWidget(buttons, 0, 0)
+
+        self.preview_status = QLabel("")
+        self.preview_status.setWordWrap(True)
+        grid.addWidget(self.preview_status, 0, 1, 1, 2)
+
+        grid.addWidget(QLabel("Prompt"), 1, 0)
+        self.preview_prompt = QLineEdit()
+        grid.addWidget(self.preview_prompt, 1, 1, 1, 2)
+
+        controls = QWidget()
+        controls_row = QHBoxLayout(controls)
+        controls_row.setContentsMargins(0, 0, 0, 0)
+        self.preview_fields = {}
+        for label, default, width in (("Seed", "42", 70), ("Steps", "20", 50),
+                                      ("Width", "512", 60), ("Height", "512", 60)):
+            controls_row.addWidget(QLabel(label))
+            entry = QLineEdit(default)
+            entry.setFixedWidth(width)
+            controls_row.addWidget(entry)
+            self.preview_fields[label.lower()] = entry
+        render = QPushButton("Render")
+        render.clicked.connect(self.__start_render)
+        controls_row.addWidget(render)
+        self.preview_auto = QCheckBox("Re-render on change")
+        self.preview_auto.setToolTip("Render again half a second after a slider stops moving. Each "
+                                     "render is a full sampling pass, so expect seconds, not frames.")
+        controls_row.addWidget(self.preview_auto)
+        controls_row.addStretch(1)
+        grid.addWidget(controls, 2, 0, 1, 3)
+
+        images = QWidget()
+        images_row = QHBoxLayout(images)
+        images_row.setContentsMargins(0, 0, 0, 0)
+        self.preview_baseline_label = QLabel("baseline")
+        self.preview_baseline_label.setFixedSize(300, 300)
+        self.preview_baseline_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        images_row.addWidget(self.preview_baseline_label)
+        self.preview_edited_label = QLabel("current sliders")
+        self.preview_edited_label.setFixedSize(300, 300)
+        self.preview_edited_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        images_row.addWidget(self.preview_edited_label)
+        images_row.addStretch(1)
+        grid.addWidget(images, 3, 0, 1, 3)
+
+        return panel
+
+    # --- preview plumbing ------------------------------------------------------------------------
+
+    def __preview_status_set(self, message: str, error: bool = False):
+        self.preview_status.setText(message)
+        self.preview_status.setStyleSheet("color: #dc3545;" if error else "color: gray;")
+
+    def __load_preview_clicked(self):
+        reason = self.controller.preview_supported()
+        if reason:
+            self.__preview_status_set(reason, error=True)
+            return
+        self.__preview_status_set("Loading the preview model — this takes a while...")
+        self.preview_load_button.setEnabled(False)
+
+        def worker():
+            error = self.controller.load_preview()
+            self._preview_loaded.emit(error or "")
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def __on_preview_loaded(self, error: str):
+        self.preview_load_button.setEnabled(True)
+        if error:
+            self.__preview_status_set(error, error=True)
+        else:
+            summary = self.controller.preview_match_summary()
+            self.__preview_status_set(f"Model loaded · {summary}" if summary else "Model loaded")
+
+    def __unload_preview_clicked(self):
+        self.controller.unload_preview()
+        self.__preview_status_set("Preview model unloaded.")
+
+    def __preview_settings(self):
+        from modules.util.repair.preview_engine import PreviewSettings
+
+        def integer(name, fallback):
+            try:
+                return int(self.preview_fields[name].text().strip())
+            except (KeyError, ValueError):
+                return fallback
+
+        return PreviewSettings(
+            prompt=self.preview_prompt.text(),
+            seed=integer("seed", 42),
+            steps=integer("steps", 20),
+            width=integer("width", 512),
+            height=integer("height", 512),
+        )
+
+    def __start_render(self):
+        if not self.controller.preview_loaded:
+            self.__preview_status_set("Load the preview model first.", error=True)
+            return
+        if self._render_busy:
+            # remember that the sliders moved again; one more render follows the current one
+            self._render_pending = True
+            return
+        self._render_busy = True
+        self.__preview_status_set("Rendering...")
+        settings = self.__preview_settings()
+
+        def worker():
+            try:
+                baseline, edited = self.controller.render_preview(settings)
+                self._preview_rendered.emit(baseline, edited, "")
+            except Exception as e:
+                self._preview_rendered.emit(None, None, str(e))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def __on_preview_rendered(self, baseline, edited, error: str):
+        self._render_busy = False
+        if error:
+            self.__preview_status_set(error, error=True)
+        else:
+            for image, label in ((baseline, self.preview_baseline_label),
+                                 (edited, self.preview_edited_label)):
+                label.setPixmap(_pil_to_pixmap(image).scaled(
+                    300, 300, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+            self.__preview_status_set("")
+        if self._render_pending:
+            self._render_pending = False
+            self.__start_render()
+
+    def __schedule_auto_render(self):
+        if self.preview_auto.isChecked() and self.controller.preview_loaded:
+            self._auto_timer.start()
 
     def __build_footer(self) -> QWidget:
         footer = QFrame()
@@ -239,17 +413,20 @@ class PySide6RepairStudioTabView(QWidget):
         self.controller.set_strength(block_id, value, donor=donor)
         self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __quick_set(self, block_id: str, action: str, *, donor: bool):
         self.controller.apply(action, block_id, donor=donor)
         self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __quick_set_all(self, action: str):
         self.controller.apply(action)
         for block_id in list(self.rows):
             self.__sync_row(block_id)
         self.__update_summary()
+        self.__schedule_auto_render()
 
     def __sync_row(self, block_id: str):
         """Push the state back into the widgets, without rebuilding them."""
@@ -289,6 +466,7 @@ class PySide6RepairStudioTabView(QWidget):
         self.donor_entry.setText(self.controller.state.donor_path)
         self.output_entry.setText(self.controller.default_output_path())
         self.refresh()
+        self.controller.sync_preview_files()
         self.__status(error or "", error=bool(error))
 
     def __browse_donor(self):
@@ -300,12 +478,14 @@ class PySide6RepairStudioTabView(QWidget):
         error = self.controller.load_donor(path)
         self.donor_entry.setText("" if error else path)
         self.refresh()
+        self.controller.sync_preview_files()
         self.__status(error or "", error=bool(error))
 
     def __clear_donor(self):
         self.controller.load_donor("")
         self.donor_entry.setText("")
         self.refresh()
+        self.controller.sync_preview_files()
 
     def __save(self):
         error, message = self.controller.save(self.output_entry.text().strip())
@@ -327,3 +507,14 @@ class PySide6RepairStudioTabView(QWidget):
 
 def format_strength(value: float) -> str:
     return f"{value:+.2f}"
+
+
+def _pil_to_pixmap(image) -> QPixmap:
+    """PIL to QPixmap through PNG bytes — no dependency on PIL.ImageQt being importable."""
+    import io as _io
+
+    buffer = _io.BytesIO()
+    image.save(buffer, format="PNG")
+    pixmap = QPixmap()
+    pixmap.loadFromData(buffer.getvalue(), "PNG")
+    return pixmap
