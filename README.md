@@ -4,6 +4,85 @@ OneTrainer is a one-stop solution for all your Diffusion training needs.
 
 <a href="https://discord.gg/KwgcQd5scF"><img src="https://discord.com/api/guilds/1102003518203756564/widget.png" alt="OneTrainer Discord"/></a><br>
 
+## About this fork
+
+This is a fork of [Nerogar/OneTrainer](https://github.com/Nerogar/OneTrainer) that adds automated
+hyperparameter search, live dataset curation, and LoRA post-processing. Everything below works in
+both UIs (CustomTkinter and PySide6) and is covered by the test suite in `tests/`.
+
+### Multi Config training — [docs](docs/MultiConfigTraining.md)
+
+A new **multi config** tab that turns one training run into a tournament: several candidate
+configurations train from the same state for one validation interval, validation loss picks the
+winner, the winner's state is promoted, and the cycle repeats until training finishes.
+
+-   **Full configs**: race 1–10 complete config files against each other
+-   **Single setting sweeps**: hold everything else fixed and sweep one setting — optimizer,
+    scheduler, learning rate, timestep distribution, or layer filter (1–10 values)
+-   **Adaptive learning rate**: a self-centering ladder of 3–10 rates; each round runs the current
+    rate and its neighbours, and the winner becomes the new centre (with decade rollover, so
+    0.0001 steps down to 0.00009)
+-   **Pruning**: drop candidates that stop winning, or drop the worst running-average loss every
+    N rounds
+-   **End early**: stop after a configurable number of validation rounds without improvement — and
+    whatever happens, the model saved to the output folder is the one with the lowest validation
+    loss seen all run
+-   **Auto validation split**: hold out a percentage of each concept (per concept, not of the
+    total) as a deterministic validation set — no separate validation concepts needed
+
+### Dataset curation — [docs](docs/DatasetCuration.md)
+
+Ported from [Fizgig](https://github.com/shootthesound/Fizgig) by Peter Neill (Apache 2.0), extended
+to work with any batch size and every model family OneTrainer trains. The run watches how hard each
+image is, normalised for the noise level each step happens to draw, and tells you which images are
+fighting you — or acts on it:
+
+-   **Detect Problem Images**: per-image loss trajectories and verdicts — `stuck` (usually a
+    caption that does not match the image), `suspect`, `exhausted`, `watch`, `learning` — reported
+    to the console, TensorBoard, and `problem_images.json`
+-   **Per-Image Adaptive LR**: throttle stuck images, ease off mined-out ones, gently boost
+    consistently healthy ones — applied by scaling each image's share of the loss
+-   **Auto-recaption stuck images**: a captioning model looks at the image and rewrites its caption
+    from what is actually visible; two escalating attempts, the original kept as `.txt.orig`,
+    exclusions written beside the images so they travel with the dataset
+-   **Look-outlier warm-up**: CLIP-scores every image against the set's median embedding and eases
+    the unusual ones in at reduced strength over the first epochs
+-   **Plateau detection**: when nothing is still improving, a banner names the epoch window worth
+    comparing checkpoints in
+-   **Problem Images window** (Tools tab): live verdicts with thumbnails, and captions you can edit
+    mid-run — the trainer picks the edit up at the next epoch boundary
+
+### Qwen3-VL captioning — [docs](docs/CaptioningAndMasking.md)
+
+`Qwen/Qwen3-VL-4B-Instruct` is available everywhere captions are generated: the dataset tools, the
+CLI, and auto-recaption. It is instructed rather than primed — the "initial caption" field becomes a
+free-text instruction — and loads **4-bit quantized by default** (~4.5GB VRAM instead of ~10.5GB),
+with a free-VRAM guard that skips a boundary rather than stalling the run. When training **Krea 2**,
+no captioner loads at all: the run's own resident Qwen3-VL text encoder is borrowed through its tied
+LM head, and on a full card the idle denoiser steps aside to system RAM for the boundary.
+
+### Repair Studio — [docs](docs/RepairStudio.md)
+
+A new **repair studio** tab (ported from Fizgig) for editing a finished LoRA per transformer block:
+
+-   One slider per block, discovered from the file's own key naming — kohya, ComfyUI,
+    diffusers/peft, and all OneTrainer formats open the same way, whatever the architecture
+-   Quick-sets on every slider: **[0]** drop the block, **[1]** trained strength, **[±]** invert,
+    **[⚖]** balance primary + donor at 1.0 to cross-fade two LoRAs
+-   **Donor blending** by exact rank concatenation — no SVD, no approximation
+-   Saves a baked `.safetensors` that runs at strength 1.0 in ComfyUI and anywhere else, verified
+    by measurement against the weighted sum it replaces
+
+### Automagic3 optimizer — [docs](docs/Automagic3.md)
+
+The Automagic3 optimizer ported from [ostris/ai-toolkit](https://github.com/ostris/ai-toolkit)
+(MIT): sign-agreement per-parameter learning rates with configurable `min_lr`/`max_lr`, available
+in the optimizer dropdown like any other.
+
+---
+
+*Everything below is the upstream OneTrainer README.*
+
 ## Features
 
 -   **Supported models**: Ernie Image, Z-Image, Qwen Image, FLUX.1, Flux.2 Dev and Klein, Chroma, Stable Diffusion 1.5, 2.0, 2.1, 3.0, 3.5, SDXL, Würstchen-v2, Stable Cascade,
