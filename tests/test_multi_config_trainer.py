@@ -88,7 +88,11 @@ class FakeModel:
     def adapters(self):
         return []
 
-    def to(self, _device):
+    def evict(self, *parts):
+        # BaseModel's API: no to(); parts move between train and temp devices
+        return self
+
+    def materialize(self, *parts):
         return self
 
     def eval(self):

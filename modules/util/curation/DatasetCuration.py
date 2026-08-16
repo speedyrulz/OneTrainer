@@ -112,7 +112,7 @@ class DatasetCuration:
             if current_device != self.device:
                 if not self._room_to_move(parameters):
                     return None
-                self._text_encoder_to(model, text_encoder, self.device)
+                self._text_encoder_to(text_encoder, self.device)
                 moved = True
 
             from modules.module.QwenVLModel import QwenVLModel
@@ -121,7 +121,7 @@ class DatasetCuration:
             if moved:
                 temp_device = torch.device(self.config.temp_device)
                 captioner.on_release(
-                    lambda: self._text_encoder_to(model, text_encoder, temp_device))
+                    lambda: self._text_encoder_to(text_encoder, temp_device))
             tqdm.write("[recaption] reusing the training run's own Qwen3-VL text encoder — "
                        "no separate captioner is loaded")
             return captioner
@@ -176,13 +176,36 @@ class DatasetCuration:
 
         return REQUIRED_FREE_GB[self.config.curate_recaption_precision]
 
+    def _part_mover(self, part: str):
+        """A device-shaped mover for one named model part, through BaseModel's own machinery.
+
+        `materialize()`/`evict()` replaced the per-model `*_to(device)` methods upstream, and only
+        move between the train and temp devices — which is the only move made here. Routing through
+        them keeps a layer offload conductor consistent with where the weights actually are.
+        """
+        model = self._model_ref
+        if not (callable(getattr(model, "materialize", None))
+                and callable(getattr(model, "evict", None))):
+            return None
+
+        def move(device: torch.device) -> None:
+            if device == self.device:
+                model.materialize(part)
+            else:
+                model.evict(part)
+
+        return move
+
     def _denoiser_mover(self):
-        """The model's own method for moving its denoiser, when it has one."""
-        for name in ("transformer_to", "unet_to", "prior_to"):
-            mover = getattr(self._model_ref, name, None)
-            if callable(mover):
-                return mover
-        return None
+        """A mover for the model's denoiser, when there is one."""
+        model_type = getattr(self._model_ref, "model_type", None)
+        if model_type is None:
+            return None
+        try:
+            part = model_type.denoising_model_part()
+        except Exception:
+            return None
+        return self._part_mover(part)
 
     @contextlib.contextmanager
     def _boundary_room(self):
@@ -231,12 +254,10 @@ class DatasetCuration:
                 gc.collect()
                 torch.cuda.empty_cache()
 
-    @staticmethod
-    def _text_encoder_to(model, text_encoder, device: torch.device) -> None:
-        """Move the text encoder through the model's own method when it has one, so a layer
-        offload conductor stays consistent with where the weights actually are."""
-        mover = getattr(model, "text_encoder_to", None)
-        if callable(mover):
+    def _text_encoder_to(self, text_encoder, device: torch.device) -> None:
+        """Move the text encoder through the model's own machinery when it has any."""
+        mover = self._part_mover("text_encoder")
+        if mover is not None:
             mover(device)
         else:
             text_encoder.to(device)

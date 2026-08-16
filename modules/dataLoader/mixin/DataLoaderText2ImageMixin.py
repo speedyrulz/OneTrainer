@@ -12,7 +12,6 @@ from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2Im
 from modules.util import path_util
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.DataType import DataType
-from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.OutputPipelineModule import OutputPipelineModule
@@ -292,10 +291,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     ):
         if before_cache_image_fun is None:
             def prepare_vae():
-                model.to(self.temp_device)
-                model.vae_to(self.train_device)
+                model.materialize_only("vae")
                 model.eval()
-                torch_gc()
             before_cache_image_fun = prepare_vae
 
         sort_names = output_names + ['concept']
@@ -358,10 +355,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if before_cache_image_fun is None:
             def prepare_vae():
-                model.to(self.temp_device)
-                model.vae_to(self.train_device)
+                model.materialize_only("vae")
                 model.eval()
-                torch_gc()
             before_cache_image_fun = prepare_vae
 
         def before_cache_text_fun():

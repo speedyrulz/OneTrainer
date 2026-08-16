@@ -171,16 +171,29 @@ def test_release_runs_the_restore_callback(tiny_encoder):
 # --- the provider's judgement ---------------------------------------------------------------------
 
 
+class FakeModelType:
+    """Just enough of ModelType: the part list, denoiser first, as the real enum declares it."""
+
+    @staticmethod
+    def denoising_model_part():
+        return "transformer"
+
+
 class FakeKrea2Model:
-    """Just enough of Krea2Model: a text_encoder and the mover curation prefers."""
+    """Just enough of Krea2Model: a text_encoder and BaseModel's materialize()/evict() API,
+    which replaced the per-model *_to(device) movers upstream."""
+
+    model_type = FakeModelType()
 
     def __init__(self, text_encoder):
         self.text_encoder = text_encoder
         self.moves: list = []
 
-    def text_encoder_to(self, device):
-        self.moves.append(device)
-        self.text_encoder.to(device)
+    def materialize(self, *parts):
+        self.moves.append(("materialize", parts))
+
+    def evict(self, *parts):
+        self.moves.append(("evict", parts))
 
 
 def make_curation(tmp_path, model, monkeypatch) -> DatasetCuration:
@@ -289,11 +302,11 @@ def test_moving_the_encoder_goes_through_the_models_own_mover(tmp_path, monkeypa
 
     captioner = curation._resident_qwen()
 
-    # moved through Krea2Model.text_encoder_to so a layer offload conductor stays consistent
-    assert holder.moves and holder.moves[0] == torch.device("cpu", 0)
+    # moved through BaseModel.materialize so a layer offload conductor stays consistent
+    assert holder.moves and holder.moves[0] == ("materialize", ("text_encoder",))
 
     captioner.release()
-    assert holder.moves[-1] == torch.device("cpu")  # and put back afterwards
+    assert holder.moves[-1] == ("evict", ("text_encoder",))  # and put back afterwards
     curation.close()
 
 
@@ -349,14 +362,11 @@ def test_a_crashing_provider_does_not_take_recaptioning_down(tmp_path, monkeypat
 
 
 class SwappableModel(FakeKrea2Model):
-    """A Krea2Model stand-in whose denoiser can be told to move."""
+    """A Krea2Model stand-in — the denoiser moves through the same materialize/evict API."""
 
-    def __init__(self, text_encoder):
-        super().__init__(text_encoder)
-        self.transformer_moves: list = []
-
-    def transformer_to(self, device):
-        self.transformer_moves.append(device)
+    @property
+    def transformer_moves(self):
+        return [m for m in self.moves if m[1] == ("transformer",)]
 
 
 def cuda_curation(tmp_path, model, monkeypatch, free_gb):
@@ -373,10 +383,10 @@ def test_a_full_card_moves_the_denoiser_aside_for_the_boundary(tmp_path, tiny_en
 
     with curation._boundary_room():
         # the denoiser left before captioning started...
-        assert model.transformer_moves == [torch.device("cpu")]
+        assert model.transformer_moves == [("evict", ("transformer",))]
 
     # ...and was back before training resumed
-    assert model.transformer_moves == [torch.device("cpu"), torch.device("cuda")]
+    assert model.transformer_moves == [("evict", ("transformer",)), ("materialize", ("transformer",))]
     curation.close()
 
 
@@ -415,12 +425,15 @@ def test_the_denoiser_comes_back_even_when_captioning_blows_up(tmp_path, tiny_en
     with pytest.raises(RuntimeError), curation._boundary_room():
         raise RuntimeError("captioning failed")
 
-    assert model.transformer_moves[-1] == torch.device("cuda")
+    assert model.transformer_moves[-1] == ("materialize", ("transformer",))
     curation.close()
 
 
 def test_a_model_with_no_movable_denoiser_still_captions_as_before(tmp_path, tiny_encoder, monkeypatch):
-    model = FakeKrea2Model(tiny_encoder)  # no transformer_to
+    class BareModel:
+        text_encoder = tiny_encoder  # no materialize/evict, no model_type
+
+    model = BareModel()
     curation = cuda_curation(tmp_path, model, monkeypatch, free_gb=0.5)
 
     with curation._boundary_room():

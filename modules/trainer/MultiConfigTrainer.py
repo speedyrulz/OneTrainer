@@ -1000,7 +1000,9 @@ class MultiConfigTrainer(GenericTrainer):
         self.config.save_filename_prefix = \
             f"{original_prefix}round{self.round_index + 1:03d}-{winner.candidate.slug}-"
         try:
-            self.model.to(self.temp_device)
+            # BaseModel.to() became evict() upstream: everything moves to the temp device,
+            # conductor-aware, which is what saving wants
+            self.model.evict()
             self.save_model_snapshot(self.model.train_progress, True)
         finally:
             self.config.save_filename_prefix = original_prefix
