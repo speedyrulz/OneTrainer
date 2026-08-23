@@ -84,7 +84,12 @@ class Krea2PreviewEngine:
                 return reason
 
             from modules.util import create
+            from modules.util.compile_util import init_compile
             from modules.util.enum.TrainingMethod import TrainingMethod
+
+            # dynamo config overrides are thread-local, and this runs on whatever worker thread the
+            # view spawned — same fix upstream applied to the sample window (#1687)
+            init_compile()
 
             # the same load the sampling tool does, minus everything training-only — and always the
             # plain base model, never the config's LoRA wrapping: the LoRA being edited is applied
@@ -219,6 +224,12 @@ class Krea2PreviewEngine:
     def _render_locked(self, settings: PreviewSettings):
         if self.sampler is None:
             raise RuntimeError("the preview model is not loaded")
+
+        from modules.util.compile_util import init_compile
+
+        # every render may arrive on a fresh worker thread, and the dynamo overrides are
+        # thread-local — without this a compiled model hits the recompile limit mid-preview
+        init_compile()
 
         from modules.util.config.SampleConfig import SampleConfig
         from modules.util.enum.ImageFormat import ImageFormat
